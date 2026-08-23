@@ -46,6 +46,12 @@ class GptOssMxfp4TritonMoELayer(MoELayer):
         self.local_intermediate_size = local_intermediate
         self.hidden_act_alpha = config.hidden_act_alpha
         self.swiglu_limit = config.swiglu_limit
+        default_dtype = torch.get_default_dtype()
+        compute_dtype = (
+            default_dtype
+            if default_dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
 
         hidden_blocks = config.hidden_size // 32
         intermediate_blocks = local_intermediate // 32
@@ -65,7 +71,7 @@ class GptOssMxfp4TritonMoELayer(MoELayer):
         self.gate_up_proj_bias = torch.empty(
             config.num_experts,
             2 * local_intermediate,
-            dtype=torch.bfloat16,
+            dtype=compute_dtype,
         )
         self.down_proj_blocks = torch.empty(
             config.num_experts,
@@ -83,7 +89,7 @@ class GptOssMxfp4TritonMoELayer(MoELayer):
         self.down_proj_bias = torch.empty(
             config.num_experts,
             config.hidden_size,
-            dtype=torch.bfloat16,
+            dtype=compute_dtype,
         )
         # Transposed split-K decode weights, built lazily in _ensure_decode_weights.
         self._gu_blocks_t = None

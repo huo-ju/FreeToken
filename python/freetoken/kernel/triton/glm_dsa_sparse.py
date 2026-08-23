@@ -60,8 +60,8 @@ def _glm_dsa_sparse_kernel(
     offs_r = tl.arange(0, D_R)
 
     q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
-    q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-    q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+    q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0)
+    q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0)
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -78,10 +78,13 @@ def _glm_dsa_sparse_kernel(
         idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
         valid = idxs >= 0
         kv_base = pool_ptr + idxs[:, None] * stride_pn
-        kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-        kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+        kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0)
+        kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0)
 
-        scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+        scores = (
+            tl.dot(q_v, tl.trans(kv_v), out_dtype=tl.float32)
+            + tl.dot(q_r, tl.trans(kv_r), out_dtype=tl.float32)
+        ) * scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -89,7 +92,9 @@ def _glm_dsa_sparse_kernel(
         alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(kv_v.dtype), kv_v)
+        acc = acc * alpha[:, None] + tl.dot(
+            p.to(kv_v.dtype), kv_v, out_dtype=tl.float32
+        )
         m_i = m_new
 
     o = acc / l_i[:, None]
@@ -147,7 +152,7 @@ def _glm_dsa_decode_logits_kernel(
                 mask=h_mask[:, None], other=0.0)
     w = tl.load(w_ptr + pid_b * stride_wb + offs_h * stride_wh, mask=h_mask, other=0.0).to(tl.float32)
 
-    score = tl.dot(q, tl.trans(k))  # [BLOCK_H, BLOCK_T] fp32
+    score = tl.dot(q, tl.trans(k), out_dtype=tl.float32)  # [BLOCK_H, BLOCK_T] fp32
     score = tl.maximum(score, 0.0) * w[:, None]
     logits = tl.sum(score, axis=0)  # [BLOCK_T]
 
@@ -237,8 +242,8 @@ def _glm_dsa_splitk_kernel(
 
     if split_end > split_start:
         q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
-        q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+        q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0)
+        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0)
         idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
 
         for start in range(split_start, split_end, BLOCK_T):
@@ -247,17 +252,22 @@ def _glm_dsa_splitk_kernel(
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
             kv_base = pool_ptr + idxs[:, None] * stride_pn
-            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+            kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0)
+            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0)
 
-            scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+            scores = (
+                tl.dot(q_v, tl.trans(kv_v), out_dtype=tl.float32)
+                + tl.dot(q_r, tl.trans(kv_r), out_dtype=tl.float32)
+            ) * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=1))
             alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
             p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
             l_i = l_i * alpha + tl.sum(p, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(kv_v.dtype), kv_v)
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(kv_v.dtype), kv_v, out_dtype=tl.float32
+            )
             m_i = m_new
 
     out = tl.where(l_i[:, None] == 0.0, 0.0, acc / l_i[:, None])

@@ -28,6 +28,12 @@ class EmbeddingDF11(BaseOP):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.n = num_embeddings * embedding_dim
+        default_dtype = torch.get_default_dtype()
+        self._compute_dtype = (
+            default_dtype
+            if default_dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
         # Placeholders; real (entropy-sized) buffers are installed by load_state_dict.
         self.low8 = torch.empty(0, dtype=torch.uint8)
         self.bitstream = torch.empty(0, dtype=torch.int32)
@@ -45,7 +51,7 @@ class EmbeddingDF11(BaseOP):
 
     @nvtx_annotate("EmbeddingDF11")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = df11_gather_decode(self._bundle(), x)  # [T, hidden] bf16
+        out = df11_gather_decode(self._bundle(), x, dtype=self._compute_dtype)
         return out.view(*x.shape, self.embedding_dim)
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:

@@ -38,6 +38,21 @@ def test_arch_helper_semantics(monkeypatch, cc, sm90_sup, sm100_sup, sm90_fam, s
 
 
 @pytest.mark.parametrize(
+    "cc, requested, expected",
+    [
+        ((7, 5), torch.bfloat16, torch.float16),
+        ((7, 5), torch.float16, torch.float16),
+        ((8, 0), torch.bfloat16, torch.bfloat16),
+        (None, torch.bfloat16, torch.bfloat16),
+    ],
+)
+def test_sm75_activation_dtype_policy(monkeypatch, cc, requested, expected):
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: cc)
+    assert arch.is_sm75_device() is (cc == (7, 5))
+    assert arch.sm75_activation_dtype(requested) == expected
+
+
+@pytest.mark.parametrize(
     "value, cc, expected",
     [
         (None, (7, 5), True),
@@ -62,6 +77,13 @@ def test_triton_turing_compat_rejects_bad_value(monkeypatch):
     monkeypatch.setenv("FREETOKEN_TRITON_TURING_COMPAT", "sometimes")
     with pytest.raises(ValueError, match="FREETOKEN_TRITON_TURING_COMPAT"):
         arch.triton_turing_compat_enabled()
+
+
+def test_sm75_dtype_policy_is_independent_of_compat_switch(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_TRITON_TURING_COMPAT", "0")
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: (7, 5))
+    assert not arch.triton_turing_compat_enabled()
+    assert arch.sm75_activation_dtype(torch.bfloat16) == torch.float16
 
 
 def _engine_config(**overrides):
@@ -116,6 +138,16 @@ def test_auto_backend_selection_by_arch(monkeypatch, major, flashinfer, sgl, exp
     config = _engine_config(attention_backend="auto")
     _adjust_config(config)
     assert config.attention_backend == expected
+
+
+def test_adjust_config_normalizes_sm75_bf16_to_fp16(monkeypatch):
+    from freetoken.engine.engine import _adjust_config
+
+    _patch_env(monkeypatch, major=7)
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: (7, 5))
+    config = _engine_config(attention_backend="triton")
+    _adjust_config(config)
+    assert config.dtype == torch.float16
 
 
 def test_explicit_trtllm_rejected_outside_sm100_family(monkeypatch):

@@ -7,12 +7,12 @@ exponent codes ``weight_scale_inv [N, K//32]``, dequant multiplier ``2**(code - 
 Decode is weight-bandwidth bound, so small batches read the fp8 weight directly in a
 split-K GEMV (half the traffic of a bf16-resident weight). The block-32 scale is
 loaded once per tile and broadcast in registers; a per-element scale gather + exp2
-costs ~3x the whole GEMV. Past the GEMV cap the forward dequantizes to bf16
-(``fp8 * 2**k`` is exact in bf16) and runs cuBLAS -- a fused inline-dequant GEMM
-never came close to cuBLAS on these shapes, so the transient is the fast option.
+costs ~3x the whole GEMV. Past the GEMV cap the forward dequantizes to the
+activation dtype and runs cuBLAS -- a fused inline-dequant GEMM never came close
+to cuBLAS on these shapes, so the transient is the fast option. This is BF16 on
+architectures with native BF16 Tensor Cores and FP16 on SM75.
 
-The GEMV accumulates in fp32; the cuBLAS path is bf16 with fp32 accumulate, same as
-any other bf16 projection.
+The GEMV accumulates in FP32; the cuBLAS path is configured for FP32 accumulation too.
 """
 
 from __future__ import annotations
@@ -126,7 +126,8 @@ def _mxfp8_gemv_splitk_kernel(
     for a BLOCK_N slice of outputs. BLOCK_K is a multiple of 32, so each chunk
     covers ``BLOCK_K // 32`` whole scale blocks: one ``[BLOCK_N, KB32]`` code load
     + exp2 per tile, broadcast over the 32-wide inner axis via a 3D register view,
-    folded into the fp8 weight BEFORE the dot (pow2 scaling is lossless in bf16)."""
+    folded into the fp8 weight BEFORE the dot (pow2 scaling is exact while the
+    value remains representable in the selected 16-bit dtype)."""
     KB32: tl.constexpr = BLOCK_K // 32
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -146,7 +147,7 @@ def _mxfp8_gemv_splitk_kernel(
             a = tl.load(
                 a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak,
                 mask=m_mask[:, None] & k_mask[None, :], other=0.0,
-            )  # [M_TILE, BLOCK_K] bf16
+            )  # [M_TILE, BLOCK_K] native 16-bit activation dtype
             if e4m3_native_cx():
                 w = tl.load(
                     w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
@@ -195,7 +196,8 @@ def _splitk_reduce_kernel(
 
 def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
           out_dtype: torch.dtype) -> torch.Tensor:
-    """Small-M split-K GEMV. ``a`` [M, K] bf16 (M <= _GEMV_MAX_M); ``weight``
+    """Small-M split-K GEMV. ``a`` [M, K] is the 16-bit activation dtype
+    (M <= _GEMV_MAX_M); ``weight``
     [N, K] fp8; ``scale_codes`` [N, K//32] uint8."""
     M, K = a.shape
     N = weight.shape[0]
@@ -250,7 +252,7 @@ def mxfp8_linear(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``y = x @ dequant(weight, scale_codes)^T``. Small batches
-    (M <= 256) -> split-K GEMV (one pass over the fp8 weight); larger M -> bf16
+    (M <= 256) -> split-K GEMV (one pass over the fp8 weight); larger M -> 16-bit
     dequant + cuBLAS (see the module docstring). ``weight`` [N, K] fp8-e4m3;
     ``scale_codes`` [N, K//32] uint8 e8m0 exponent codes (dequant multiplier
     ``2**(code - 127)``)."""
@@ -265,7 +267,7 @@ def mxfp8_linear(
         w8 = e4m3_kernel_view(weight)
         out = _gemv(x.reshape(M, K), w8, scale_codes, x.dtype).reshape(*lead, N)
     else:
-        # Per-call bf16 transient (pow2 descale is lossless in bf16) + cuBLAS.
+        # Per-call activation-dtype transient + cuBLAS (FP32 accumulation).
         w = mxfp8_dequant(weight, scale_codes, dtype=x.dtype)
         out = torch.nn.functional.linear(x.reshape(-1, K), w).reshape(*lead, N)
     if bias is not None:

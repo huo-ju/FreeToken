@@ -13,6 +13,11 @@ import pytest
 import torch
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+ACT_DTYPE = (
+    torch.float16
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (7, 5)
+    else torch.bfloat16
+)
 
 
 def _tiny_config():
@@ -69,7 +74,7 @@ def _make_offload_cache(config, device, *, cache_size=None, prefill_overlap=Fals
         None,
         config,
         device=device,
-        dtype=torch.bfloat16,
+        dtype=ACT_DTYPE,
         dummy=True,
     )
     cache = OffloadMoeCache(
@@ -97,7 +102,7 @@ def test_gpt_oss_fused_routing_matches_softmax_topk_renorm(num_experts):
     device = torch.device("cuda")
     torch.manual_seed(0)
     tokens, top_k = 5, 4
-    logits = torch.randn(tokens, num_experts, device=device, dtype=torch.bfloat16)
+    logits = torch.randn(tokens, num_experts, device=device, dtype=ACT_DTYPE)
 
     weights, ids = gpt_oss_fused_routing(logits, top_k)
     assert weights.shape == (tokens, top_k)
@@ -137,12 +142,12 @@ def _mxfp4_dequant_reference(run, M, seed):
 
     gu_b = torch.randint(0, 256, (E, 2 * I, hb, 16), device=device, dtype=torch.uint8, generator=gen)
     gu_s = torch.full((E, 2 * I, hb), 124, device=device, dtype=torch.uint8)
-    gu_bias = 0.05 * torch.randn(E, 2 * I, device=device, dtype=torch.bfloat16, generator=gen)
+    gu_bias = 0.05 * torch.randn(E, 2 * I, device=device, dtype=ACT_DTYPE, generator=gen)
     dn_b = torch.randint(0, 256, (E, H, ib, 16), device=device, dtype=torch.uint8, generator=gen)
     dn_s = torch.full((E, H, ib), 124, device=device, dtype=torch.uint8)
-    dn_bias = 0.05 * torch.randn(E, H, device=device, dtype=torch.bfloat16, generator=gen)
+    dn_bias = 0.05 * torch.randn(E, H, device=device, dtype=ACT_DTYPE, generator=gen)
 
-    hidden = 0.1 * torch.randn(M, H, device=device, dtype=torch.bfloat16, generator=gen)
+    hidden = 0.1 * torch.randn(M, H, device=device, dtype=ACT_DTYPE, generator=gen)
     tid = torch.randint(0, E, (M, top_k), device=device, dtype=torch.int32, generator=gen)
     tw = torch.rand(M, top_k, device=device, dtype=torch.float32, generator=gen)
 
@@ -205,7 +210,7 @@ def test_offload_decode_bit_identical_under_eviction(tp1):
     layer0.offload_cache = cache
 
     torch.manual_seed(42)
-    hidden = 0.1 * torch.randn(1, H, device=dev, dtype=torch.bfloat16)
+    hidden = 0.1 * torch.randn(1, H, device=dev, dtype=ACT_DTYPE)
     tw = torch.tensor([[0.6, 0.4]], dtype=torch.float32, device=dev)
 
     def ref(layer_id: int, expert_ids: list[int]) -> torch.Tensor:
@@ -257,8 +262,8 @@ def test_offload_prefill_overlap_matches_reference(M, tp1):
     layer.offload_cache = cache
 
     torch.manual_seed(2)
-    hidden = 0.1 * torch.randn(M, H, device=dev, dtype=torch.bfloat16)
-    logits = torch.randn(M, E, device=dev, dtype=torch.bfloat16)
+    hidden = 0.1 * torch.randn(M, H, device=dev, dtype=ACT_DTYPE)
+    logits = torch.randn(M, E, device=dev, dtype=ACT_DTYPE)
     tw, tid = layer._topk(logits.contiguous())
 
     out_overlap = layer._prefill_routed(hidden, tw, tid.clone())  # must not raise

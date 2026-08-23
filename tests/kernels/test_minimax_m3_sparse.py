@@ -35,6 +35,11 @@ from freetoken.kernel.triton.minimax_m3_sparse import (
 
 BLK = SPARSE_BLOCK_SIZE
 DEV = "cuda"
+ACT_DTYPE = (
+    torch.float16
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (7, 5)
+    else torch.bfloat16
+)
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +93,8 @@ def assert_topk_membership_or_tie(
 ) -> None:
     """Accept a different block only when it is exactly tied at the top-k cutoff.
 
-    CUDA/Triton and ``torch.topk`` do not promise the same index tie-break. BF16
-    score collisions are possible on SM75, so membership is unique only above
+    CUDA/Triton and ``torch.topk`` do not promise the same index tie-break. A 16-bit
+    score path can collide at the cutoff, so membership is unique only above
     the cutoff; equally scored boundary blocks are semantically interchangeable.
     """
     got_set = set(got[:k])
@@ -180,8 +185,8 @@ def test_prefill_index_score_and_topk(kv_len: int, q_len: int, topk: int):
     torch.manual_seed(0)
     prefix = kv_len - q_len
     nblocks = (kv_len + BLK - 1) // BLK
-    iq = torch.randn(q_len, H_IDX, D_IDX, device=DEV, dtype=torch.bfloat16)
-    ik = torch.randn(kv_len, D_IDX, device=DEV, dtype=torch.bfloat16)
+    iq = torch.randn(q_len, H_IDX, D_IDX, device=DEV, dtype=ACT_DTYPE)
+    ik = torch.randn(kv_len, D_IDX, device=DEV, dtype=ACT_DTYPE)
     q_pos = torch.arange(prefix, kv_len, device=DEV)
 
     block_rows, total_pages = make_layout(nblocks)
@@ -217,7 +222,7 @@ def test_decode_index_topk(kv_lens: list[int], topk: int):
     torch.manual_seed(1)
     bs = len(kv_lens)
     max_nb = max((L + BLK - 1) // BLK for L in kv_lens)
-    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=torch.bfloat16)
+    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=ACT_DTYPE)
     block_rows = torch.zeros(bs, max_nb, dtype=torch.int32, device=DEV)
     slabs = []
     total = 0
@@ -228,11 +233,11 @@ def test_decode_index_topk(kv_lens: list[int], topk: int):
         layouts.append((br, pages))
         block_rows[i, :nb] = br + total * BLK
         total += pages
-    slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=torch.bfloat16)
+    slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=ACT_DTYPE)
     iks = []
     off = 0
     for i, L in enumerate(kv_lens):
-        ik = torch.randn(L, D_IDX, device=DEV, dtype=torch.bfloat16)
+        ik = torch.randn(L, D_IDX, device=DEV, dtype=ACT_DTYPE)
         iks.append(ik)
         br, pages = layouts[i]
         sub = scatter_rows(ik, br, pages, fill=0.0)
@@ -256,11 +261,11 @@ def _attend_case(kv_len: int, q_len: int, seed: int):
     torch.manual_seed(seed)
     prefix = kv_len - q_len
     nblocks = (kv_len + BLK - 1) // BLK
-    q = torch.randn(q_len, HQ, D, device=DEV, dtype=torch.bfloat16)
-    k = torch.randn(kv_len, KVH, D, device=DEV, dtype=torch.bfloat16)
-    v = torch.randn(kv_len, KVH, D, device=DEV, dtype=torch.bfloat16)
-    iq = torch.randn(q_len, H_IDX, D_IDX, device=DEV, dtype=torch.bfloat16)
-    ik = torch.randn(kv_len, D_IDX, device=DEV, dtype=torch.bfloat16)
+    q = torch.randn(q_len, HQ, D, device=DEV, dtype=ACT_DTYPE)
+    k = torch.randn(kv_len, KVH, D, device=DEV, dtype=ACT_DTYPE)
+    v = torch.randn(kv_len, KVH, D, device=DEV, dtype=ACT_DTYPE)
+    iq = torch.randn(q_len, H_IDX, D_IDX, device=DEV, dtype=ACT_DTYPE)
+    ik = torch.randn(kv_len, D_IDX, device=DEV, dtype=ACT_DTYPE)
     q_pos = torch.arange(prefix, kv_len, device=DEV)
     block_rows, total_pages = make_layout(nblocks, seed=seed)
     return q, k, v, iq, ik, q_pos, block_rows, total_pages, nblocks, prefix
@@ -338,8 +343,8 @@ def test_decode_attend(kv_lens: list[int], topk: int):
     torch.manual_seed(4)
     bs = len(kv_lens)
     max_nb = max((L + BLK - 1) // BLK for L in kv_lens)
-    q = torch.randn(bs, HQ, D, device=DEV, dtype=torch.bfloat16)
-    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=torch.bfloat16)
+    q = torch.randn(bs, HQ, D, device=DEV, dtype=ACT_DTYPE)
+    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=ACT_DTYPE)
     block_rows = torch.zeros(bs, max_nb, dtype=torch.int32, device=DEV)
     total = 0
     layouts = []
@@ -351,15 +356,15 @@ def test_decode_attend(kv_lens: list[int], topk: int):
         total += pages
     # K/V gaps carry NaN (the serving pool is torch.empty; the kernels must
     # pos-mask); the index slab stays zeroed (BSAKVCache invariant).
-    k_slab = torch.full((total * BLK, KVH, D), float("nan"), device=DEV, dtype=torch.bfloat16)
+    k_slab = torch.full((total * BLK, KVH, D), float("nan"), device=DEV, dtype=ACT_DTYPE)
     v_slab = torch.full_like(k_slab, float("nan"))
-    ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=torch.bfloat16)
+    ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=ACT_DTYPE)
     ks, vs, iks = [], [], []
     off = 0
     for i, L in enumerate(kv_lens):
-        kk = torch.randn(L, KVH, D, device=DEV, dtype=torch.bfloat16)
-        vv = torch.randn(L, KVH, D, device=DEV, dtype=torch.bfloat16)
-        ik = torch.randn(L, D_IDX, device=DEV, dtype=torch.bfloat16)
+        kk = torch.randn(L, KVH, D, device=DEV, dtype=ACT_DTYPE)
+        vv = torch.randn(L, KVH, D, device=DEV, dtype=ACT_DTYPE)
+        ik = torch.randn(L, D_IDX, device=DEV, dtype=ACT_DTYPE)
         ks.append(kk); vs.append(vv); iks.append(ik)
         br, pages = layouts[i]
         k_slab[off * BLK : (off + pages) * BLK] = scatter_rows(kk, br, pages)
@@ -400,19 +405,19 @@ def test_decode_attend_capture_replay_mutated_lengths():
         block_rows[i] = br + total * BLK
         total += pages
     k_slab = torch.full(
-        (total * BLK, KVH, D), float("nan"), device=DEV, dtype=torch.bfloat16
+        (total * BLK, KVH, D), float("nan"), device=DEV, dtype=ACT_DTYPE
     )
     v_slab = torch.full_like(k_slab, float("nan"))
-    ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=torch.bfloat16)
+    ik_slab = torch.zeros(total * BLK, D_IDX, device=DEV, dtype=ACT_DTYPE)
 
     def refresh(seed):
         torch.manual_seed(seed)
         ks, vs, iks = [], [], []
         off = 0
         for i in range(bs):
-            kk = torch.randn(MAXL, KVH, D, device=DEV, dtype=torch.bfloat16)
-            vv = torch.randn(MAXL, KVH, D, device=DEV, dtype=torch.bfloat16)
-            ik = torch.randn(MAXL, D_IDX, device=DEV, dtype=torch.bfloat16)
+            kk = torch.randn(MAXL, KVH, D, device=DEV, dtype=ACT_DTYPE)
+            vv = torch.randn(MAXL, KVH, D, device=DEV, dtype=ACT_DTYPE)
+            ik = torch.randn(MAXL, D_IDX, device=DEV, dtype=ACT_DTYPE)
             ks.append(kk); vs.append(vv); iks.append(ik)
             br, pages = layouts[i]
             k_slab[off * BLK : (off + pages) * BLK] = scatter_rows(kk, br, pages)
@@ -421,8 +426,8 @@ def test_decode_attend_capture_replay_mutated_lengths():
             off += pages
         return ks, vs, iks
 
-    q = torch.randn(bs, HQ, D, device=DEV, dtype=torch.bfloat16)
-    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=torch.bfloat16)
+    q = torch.randn(bs, HQ, D, device=DEV, dtype=ACT_DTYPE)
+    iq = torch.randn(bs, H_IDX, D_IDX, device=DEV, dtype=ACT_DTYPE)
     seq = torch.tensor(LENS, dtype=torch.int32, device=DEV)
     out = torch.empty_like(q)
     data = refresh(100)

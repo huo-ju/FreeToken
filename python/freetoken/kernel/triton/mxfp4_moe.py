@@ -96,6 +96,7 @@ def mxfp4_splitk_reduce_kernel(
     HAS_EXPERT_WTS: tl.constexpr,
     NUM_K_SPLITS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    OUT: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_e = tl.program_id(1)
@@ -109,7 +110,7 @@ def mxfp4_splitk_reduce_kernel(
         )
     if HAS_EXPERT_WTS:
         acc *= ewt
-    tl.store(out_ptr + pid_e * N + offs_n, acc.to(tl.bfloat16), mask=mask_n)
+    tl.store(out_ptr + pid_e * N + offs_n, acc.to(OUT), mask=mask_n)
 
 
 @triton.jit
@@ -221,7 +222,7 @@ def mxfp4_fused_moe_kernel(
         scale = tl.exp2(scale_u8.to(tl.float32) - 127.0)
         b = (_dequant_fp4_lut(nibble) * scale).to(compute_type)
 
-        accumulator += tl.dot(a, b)
+        accumulator += tl.dot(a, b, out_dtype=tl.float32)
         a_ptrs += BLOCK_SIZE_K * stride_ak
 
     bias = tl.load(
@@ -329,4 +330,3 @@ def gpt_oss_routing_kernel(
     out_off = token_id * K + offs_e
     tl.store(topk_weights_ptr + out_off, weights, mask=top_mask)
     tl.store(topk_ids_ptr + out_off, all_ids, mask=top_mask)
-

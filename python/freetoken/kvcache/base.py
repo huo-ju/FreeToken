@@ -18,10 +18,10 @@ class CacheRebuildRejected(Exception):
 
 def spec_kv_bytes_per_token(spec, config) -> int:
     """One paged-KV group's bytes per token: (1|2 slabs) x head_dim x local kv heads x dtype
-    x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
+    x layers, plus the 16-bit DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
-    branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)"""
+    branching here. The DSA pool uses the model activation dtype (BF16 or FP16),
+    both of which occupy 2 bytes per element."""
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim

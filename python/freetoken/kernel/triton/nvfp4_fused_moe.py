@@ -305,8 +305,8 @@ def _prefill_nvfp4_moe_kernel(
 
         a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
         a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
-        accumulator += tl.dot(a_lo, b_lo.to(a_lo.dtype))
-        accumulator += tl.dot(a_hi, b_hi.to(a_hi.dtype))
+        accumulator += tl.dot(a_lo, b_lo.to(a_lo.dtype), out_dtype=tl.float32)
+        accumulator += tl.dot(a_hi, b_hi.to(a_hi.dtype), out_dtype=tl.float32)
 
         a_ptrs_lo += BLOCK_SIZE_KB * 2 * stride_ak
         a_ptrs_hi += BLOCK_SIZE_KB * 2 * stride_ak

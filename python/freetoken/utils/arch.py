@@ -49,6 +49,38 @@ def is_sm100_supported() -> bool:
     return is_arch_supported(10, 0)
 
 
+def is_sm75_device(device=None) -> bool:
+    """Whether ``device`` is exactly an NVIDIA Turing SM75 GPU.
+
+    This is intentionally independent of ``FREETOKEN_TRITON_TURING_COMPAT``:
+    that switch controls launch/layout workarounds, while the lack of native BF16
+    Tensor Cores is a hardware property and must not be disabled accidentally.
+    """
+    if device is None:
+        capability = _get_torch_cuda_version()
+    else:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        capability = torch.cuda.get_device_capability(device)
+    return capability == (7, 5)
+
+
+def sm75_activation_dtype(dtype, device=None):
+    """Resolve the 16-bit activation dtype for an SM75 execution device.
+
+    Turing Tensor Cores support FP16 inputs with FP32 accumulation, but not BF16.
+    Treat a requested BF16 dtype as a checkpoint/storage request and serve it as
+    FP16 instead of asking Triton or PyTorch to emulate BF16 arithmetic.
+    """
+    import torch
+
+    if dtype == torch.bfloat16 and is_sm75_device(device):
+        return torch.float16
+    return dtype
+
+
 _TRUE = frozenset({"1", "true", "yes", "on"})
 _FALSE = frozenset({"0", "false", "no", "off"})
 
@@ -77,12 +109,4 @@ def triton_turing_compat_enabled(device=None) -> bool:
             f"got {raw!r}"
         )
 
-    if device is None:
-        capability = _get_torch_cuda_version()
-    else:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        capability = torch.cuda.get_device_capability(device)
-    return capability == (7, 5)
+    return is_sm75_device(device)

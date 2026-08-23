@@ -176,15 +176,17 @@ def _prefill_fp8_moe_kernel(
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for kb in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         kmask = offs_k[None, :] < K - kb * BLOCK_SIZE_K
-        a = tl.load(a_ptrs, mask=token_mask[:, None] & kmask, other=0.0)  # fp8 (emu: bf16 grid)
+        a = tl.load(a_ptrs, mask=token_mask[:, None] & kmask, other=0.0)  # fp8 (emu: 16-bit grid)
         w_mask = offs_k[:, None] < K - kb * BLOCK_SIZE_K
         if e4m3_native_cx():
             w = tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0.0)  # fp8
         else:
-            w = e4m3_u8_to_f32(tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0)).to(tl.bfloat16)
+            w = e4m3_u8_to_f32(
+                tl.load(w_base + offs_k[:, None] * stride_wk, mask=w_mask, other=0)
+            ).to(a.dtype)
         wsc = tl.load(s_base + kb * stride_sk).to(tl.float32)
         asc = tl.load(as_base + kb * stride_ask, mask=token_mask, other=0.0).to(tl.float32)
-        acc += tl.dot(a, w) * asc[:, None] * wsc
+        acc += tl.dot(a, w, out_dtype=tl.float32) * asc[:, None] * wsc
         a_ptrs += BLOCK_SIZE_K * stride_ak
         w_base += BLOCK_SIZE_K * stride_wk
 

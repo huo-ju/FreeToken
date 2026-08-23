@@ -29,6 +29,7 @@ def _df11_decode_kernel(
     ROWS: tl.constexpr,
     LMAX: tl.constexpr,
     BLOCK: tl.constexpr,   # chunks decoded in parallel per program (one per lane)
+    OUTPUT_FP16: tl.constexpr,
 ):
     # Each lane owns one chunk j and decodes its symbols serially (Huffman is variable-length).
     # Interleaving means lane j handles position i*G+j at step i, so consecutive lanes touch
@@ -72,26 +73,46 @@ def _df11_decode_kernel(
         sign = (low >> 7) & 1
         mant = low & 0x7F
         u16 = (sign << 15) | (sym << 7) | mant
-        tl.store(out_ptr + idx, u16.to(tl.int16), mask=valid)
+        if OUTPUT_FP16:
+            # Decode the BF16 storage value through its exact FP32 bit pattern,
+            # then round once to FP16. Avoid introducing a BF16 IR value on SM75.
+            f32 = (u16.to(tl.uint32) << 16).to(tl.float32, bitcast=True)
+            tl.store(out_ptr + idx, f32.to(tl.float16), mask=valid)
+        else:
+            tl.store(out_ptr + idx, u16.to(tl.int16), mask=valid)
 
 
-def df11_decompress(c: dict, out: torch.Tensor | None = None, block: int = 128) -> torch.Tensor:
-    """Decode a DF11 bundle back to its exact BF16 tensor.
+def df11_decompress(
+    c: dict,
+    out: torch.Tensor | None = None,
+    block: int = 128,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Decode a DF11 bundle to BF16, or convert it directly to FP16.
 
     If ``out`` (an int16 buffer of shape ``[OUT, IN]``) is given it is filled in place; this
-    lets callers preallocate and reuse it under CUDA graphs. Returns a bf16 view.
+    lets callers preallocate and reuse it under CUDA graphs. FP16 output uses an
+    FP16 buffer and never materializes an intermediate BF16 tensor.
     """
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"DF11 output must be bfloat16 or float16, got {dtype}")
     out_features, in_features, n, num_chunks, rows, lmax = c["meta"]
     if out is None:
-        out = torch.empty((out_features, in_features), dtype=torch.int16, device=c["low8"].device)
-    assert out.dtype == torch.int16 and out.is_contiguous()
+        storage_dtype = torch.int16 if dtype == torch.bfloat16 else torch.float16
+        out = torch.empty(
+            (out_features, in_features), dtype=storage_dtype, device=c["low8"].device
+        )
+    expected = torch.int16 if dtype == torch.bfloat16 else torch.float16
+    assert out.dtype == expected and out.is_contiguous()
     grid = ((num_chunks + block - 1) // block,)
     _df11_decode_kernel[grid](
         c["low8"], c["bitstream"], c["chunk_start"], c["lut"],
         out, n, num_chunks, c["bitstream"].numel(),
-        ROWS=rows, LMAX=lmax, BLOCK=block, num_warps=block // 32,
+        ROWS=rows, LMAX=lmax, BLOCK=block, OUTPUT_FP16=dtype == torch.float16,
+        num_warps=block // 32,
     )
-    return out.view(torch.bfloat16)
+    return out.view(torch.bfloat16) if dtype == torch.bfloat16 else out
 
 
 @triton.jit
@@ -107,6 +128,7 @@ def _df11_gather_kernel(
     NWORDS,
     LMAX: tl.constexpr,
     BLOCK: tl.constexpr,   # rows decoded in parallel per program (one per lane)
+    OUTPUT_FP16: tl.constexpr,
 ):
     # One lane decodes one gathered row r = ids[t] serially, reading its contiguous code stream
     # via the same 64-bit bit-buffer as the matmul decoder. Embedding lookups touch very few rows
@@ -144,28 +166,43 @@ def _df11_gather_kernel(
         sign = (low >> 7) & 1
         mant = low & 0x7F
         u16 = (sign << 15) | (sym << 7) | mant
-        tl.store(out_ptr + out_base + k, u16.to(tl.int16), mask=tvalid)
+        if OUTPUT_FP16:
+            f32 = (u16.to(tl.uint32) << 16).to(tl.float32, bitcast=True)
+            tl.store(out_ptr + out_base + k, f32.to(tl.float16), mask=tvalid)
+        else:
+            tl.store(out_ptr + out_base + k, u16.to(tl.int16), mask=tvalid)
 
 
 def df11_gather_decode(
-    c: dict, ids: torch.Tensor, out: torch.Tensor | None = None, block: int = 128
+    c: dict,
+    ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    block: int = 128,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Decode the embedding rows ``ids`` from a row-contiguous DF11 bundle into ``[T, C]`` bf16.
+    """Decode gathered rows from a row-contiguous DF11 bundle to BF16 or FP16.
 
-    Pass a preallocated int16 ``out`` to stay CUDA-graph safe (decode batch size is fixed).
+    Pass a preallocated int16 ``out`` for BF16 or FP16 ``out`` for FP16 to stay
+    CUDA-graph safe (decode batch size is fixed).
     """
+    if dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(f"DF11 output must be bfloat16 or float16, got {dtype}")
     rows, cols, n, lmax = c["meta"]
     ids = ids.reshape(-1).contiguous()
     t = ids.numel()
     if out is None:
-        out = torch.empty((t, cols), dtype=torch.int16, device=c["low8"].device)
-    assert out.dtype == torch.int16 and out.is_contiguous()
+        storage_dtype = torch.int16 if dtype == torch.bfloat16 else torch.float16
+        out = torch.empty((t, cols), dtype=storage_dtype, device=c["low8"].device)
+    expected = torch.int16 if dtype == torch.bfloat16 else torch.float16
+    assert out.dtype == expected and out.is_contiguous()
     grid = ((t + block - 1) // block,)
     _df11_gather_kernel[grid](
         c["low8"], c["bitstream"], c["chunk_start"], c["lut"], ids, out,
-        t, cols, c["bitstream"].numel(), LMAX=lmax, BLOCK=block, num_warps=block // 32,
+        t, cols, c["bitstream"].numel(), LMAX=lmax, BLOCK=block,
+        OUTPUT_FP16=dtype == torch.float16, num_warps=block // 32,
     )
-    return out.view(torch.bfloat16)
+    return out.view(torch.bfloat16) if dtype == torch.bfloat16 else out
 
 
 __all__ = ["df11_decompress", "df11_gather_decode"]

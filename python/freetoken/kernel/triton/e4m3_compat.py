@@ -5,8 +5,9 @@ check sits in ``dtype.to_ir``, so even an fp8 *pointer argument* is illegal.
 Affected kernels branch on :func:`e4m3_native_cx` (a compile-time constexpr): the
 native branch stays byte-identical on sm_89+, the emulated branch is dead-code
 eliminated there. When the emulated branch is active, wrappers must pass e4m3
-tensors as ``.view(torch.uint8)`` and allocate act-quant outputs as bf16 -- use
-the host-side twin :func:`e4m3_native` for those decisions.
+tensors as ``.view(torch.uint8)`` and allocate act-quant outputs in a native
+16-bit Tensor Core dtype (FP16 on SM75, BF16 on SM80/86) -- use the host-side
+twin :func:`e4m3_native` for those decisions.
 
 ``FREETOKEN_FORCE_E4M3_EMU=1`` (or true/yes/on) forces the emulated path on any
 GPU (for A/B validation against the native fp8 unit). The flag is read ONCE at
@@ -48,7 +49,7 @@ _native: bool | None = None
 
 def e4m3_native() -> bool:
     """Host-side twin of :func:`e4m3_native_cx`: True when kernels take fp8e4nv
-    tensors directly. False: pass ``.view(torch.uint8)`` and bf16 act buffers."""
+    tensors directly. False: pass ``.view(torch.uint8)`` and emulated act buffers."""
     global _native
     if _env_force() != FORCE_EMU:
         raise RuntimeError(
@@ -74,9 +75,17 @@ def e4m3_kernel_view(t: torch.Tensor) -> torch.Tensor:
 
 
 def e4m3_act_dtype() -> torch.dtype:
-    """Buffer dtype for quantized activations: fp8 when native, else bf16 (every
-    e4m3 grid value is exactly representable)."""
-    return torch.float8_e4m3fn if e4m3_native() else torch.bfloat16
+    """Buffer dtype for quantized activations.
+
+    Every e4m3 grid value is exact in both FP16 and BF16. Use FP16 on SM75 so
+    the fallback dot lowers to native Turing Tensor Cores; SM80/86 retain their
+    native BF16 Tensor Core path.
+    """
+    if e4m3_native():
+        return torch.float8_e4m3fn
+    from freetoken.utils import sm75_activation_dtype
+
+    return sm75_activation_dtype(torch.bfloat16)
 
 
 @constexpr_function

@@ -171,7 +171,7 @@ def _index_block_score_kernel(
                 + (base + sub + off_k[None, :]) * stride_ik_r
                 + off_d[:, None] * stride_ik_d,
             )
-            qk = tl.dot(q, k)
+            qk = tl.dot(q, k, out_dtype=tl.float32)
             if q_start < i + LOGICAL_BLOCK_SIZE:
                 qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
             score = tl.maximum(score, tl.max(qk, axis=1))
@@ -661,7 +661,7 @@ def _gqa_sparse_fwd_kernel(
                 mask=d_mask[:, None] & pos_mask[None, :],
                 other=0.0,
             )  # [D, N]
-            qk = tl.dot(q, k) * sm_scale_log2e
+            qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
             alpha = tl.where(m_ij == float("-inf"), 1.0, tl.exp2(m_i - m_ij))
@@ -676,7 +676,7 @@ def _gqa_sparse_fwd_kernel(
                 mask=pos_mask[:, None] & d_mask[None, :],
                 other=0.0,
             )  # [N, D]
-            acc_o += tl.dot(p.to(v.dtype), v)
+            acc_o += tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
             m_i = m_ij
             lse_i = tl.where(
                 m_ij == float("-inf"),
@@ -788,7 +788,7 @@ def _gqa_sparse_decode_kernel(
             )
             qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            qk += tl.dot(q, k) * sm_scale_log2e
+            qk += tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
             p = tl.exp2(qk - m_ij[:, None])
             l_ij = tl.sum(p, axis=1)
@@ -801,7 +801,7 @@ def _gqa_sparse_decode_kernel(
                 mask=pos_mask[:, None] & d_mask[None, :],
                 other=0.0,
             )
-            acc_o += tl.dot(p.to(v.dtype), v)
+            acc_o += tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
             m_i = m_ij
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
 

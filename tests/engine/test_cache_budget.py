@@ -231,7 +231,7 @@ def test_adjust_config_resolves_num_tokens_generic():
         cuda_graph_bs = [1, 2]
         max_seq_len = 1024
         page_size = 1
-        attention_backend = "fi"
+        attention_backend = "triton"
         nvfp4_backend = "auto"
         num_page_override = None
         num_token_override = 5000
@@ -375,7 +375,9 @@ def _offload_engine_config(**overrides):
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.bfloat16,
-        attention_backend="fi",
+        # Self-contained backend: these config-resolution tests do not exercise
+        # FlashInfer and must also run in the minimal Triton-only environment.
+        attention_backend="triton",
         **overrides,
     )
     object.__setattr__(
@@ -433,6 +435,41 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert is_offload_moe_backend(config.moe_backend)
     assert config.moe_cache_auto is True
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
+
+
+def test_sm75_auto_ignores_hybrid_bandwidth_recommendation(monkeypatch):
+    """A bandwidth-only profile must not select the BF16-only CPU ABI on Turing."""
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.moe import bench_profile
+    from freetoken.utils import arch
+
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: (7, 5))
+    monkeypatch.setattr(bench_profile, "load_backend_recommendation", lambda *a, **k: "hybrid")
+    config = _offload_engine_config()
+
+    _adjust_config(config)
+
+    assert config.dtype == torch.float16
+    assert config.moe_backend == "offload"
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"moe_backend": "cpu"}, "--moe-backend 'cpu'"),
+        ({"moe_backend": "hybrid"}, "--moe-backend 'hybrid'"),
+        ({"moe_backend": "offload", "moe_cpu_layers": "2"}, "--moe-cpu-layers='2'"),
+    ],
+)
+def test_sm75_rejects_bf16_cpu_moe_paths(monkeypatch, overrides, match):
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.utils import arch
+
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: (7, 5))
+    config = _offload_engine_config(**overrides)
+
+    with pytest.raises(ValueError, match=match):
+        _adjust_config(config)
 
 
 def test_page_table_width_covers_whole_trailing_pages():

@@ -56,7 +56,7 @@ def _act_quant_kernel(
     if e4m3_native_cx():
         y = y.to(tl.float8e4nv)
     else:
-        y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
+        y = round_e4m3(y)  # e4m3-grid values into the wrapper's native 16-bit buffer
     tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk, y, mask=m_mask[:, None])
     tl.store(s_ptr + offs_m * stride_sm + pid_k * stride_sk, s, mask=m_mask)
 
@@ -113,8 +113,9 @@ def _block_fp8_gemm_kernel(
         if e4m3_native_cx():
             p = tl.dot(a, tl.trans(w), out_dtype=tl.float32)
         else:
-            # bf16 dot on the same e4m3 grid: operands exact in bf16, fp32 acc
-            p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(tl.bfloat16)), out_dtype=tl.float32)
+            # Same exact e4m3 grid in the activation buffer's native 16-bit
+            # Tensor Core dtype (FP16 on SM75, BF16 on SM80/86); FP32 acc.
+            p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(a.dtype)), out_dtype=tl.float32)
         sa = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0.0).to(tl.float32)
         sb = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk).to(tl.float32)
         acc += p * sa[:, None] * sb
