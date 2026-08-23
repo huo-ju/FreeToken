@@ -162,8 +162,14 @@ class OffloadMoeCache:
         self.usage = torch.zeros((self.cache_size,), dtype=torch.int64, device=self.device)
         self.step = torch.zeros((), dtype=torch.int64, device=self.device)
         self.active_mask = torch.zeros((self.num_experts,), dtype=torch.int32, device=self.device)
-        self.evict_slots = torch.empty((self.num_experts,), dtype=torch.int32, device=self.device)
-        self.src_indices = torch.empty((self.num_experts,), dtype=torch.int32, device=self.device)
+        # flashlib sizes an admission plan as min(query.numel(), cache_size), not
+        # by the number of distinct expert ids. Decode batches can contain more
+        # routed positions than E (for example GPT-OSS bs=16, top-k=4, E=32), so
+        # E-sized buffers fail validation even though dedup later emits <= E copies.
+        # cache_size is the exact upper bound required by lru_ensure and is tiny
+        # relative to the expert payloads (two int32 arrays).
+        self.evict_slots = torch.empty((self.cache_size,), dtype=torch.int32, device=self.device)
+        self.src_indices = torch.empty((self.cache_size,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the

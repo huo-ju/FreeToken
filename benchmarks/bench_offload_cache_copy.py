@@ -127,10 +127,22 @@ def prepare_state(
     # real work) but never a hit for LAYER_ID. Slot ownership lives in flashlib's flat id
     # space: id == layer_id * num_experts + expert.
     cache.slot_for_id.fill_(-1)
-    other_layer_experts = (
-        torch.arange(cache.cache_size, dtype=torch.int32, device=device) % cache.num_experts
+    # The reverse map must contain UNIQUE ids and agree with slot_for_id. Repeating
+    # layer-1 expert ids here used to create an invalid LRU state whenever cache_size
+    # exceeded E; flashlib could then plan more moves than the E-sized scratch buffers
+    # and abort the bs=16 sweep. Spread occupants over layers 1..L-1 instead.
+    assert cache.cache_size <= (cache.num_layers - 1) * cache.num_experts, (
+        "benchmark cache must leave one layer absent so every initial occupant can be a miss"
     )
-    cache.id_of_slot.copy_(cache.num_experts + other_layer_experts)  # layer 1
+    other_ids = torch.arange(
+        cache.num_experts,
+        cache.num_experts + cache.cache_size,
+        dtype=torch.int32,
+        device=device,
+    )
+    slots = torch.arange(cache.cache_size, dtype=torch.int32, device=device)
+    cache.id_of_slot.copy_(other_ids)
+    cache.slot_for_id.view(-1)[other_ids.long()] = slots
     cache.usage.copy_(torch.arange(cache.cache_size, dtype=torch.int64, device=device) + 1)
     cache.step.zero_()
     cache.num_indices.zero_()
@@ -138,6 +150,8 @@ def prepare_state(
     cached_count = active_unique - miss_count
     if cached_count:
         experts = torch.arange(cached_count, dtype=torch.int32, device=device)
+        displaced = cache.id_of_slot[:cached_count].long()
+        cache.slot_for_id.view(-1)[displaced] = -1
         cache.slot_for_id[LAYER_ID, :cached_count] = experts
         cache.id_of_slot[:cached_count] = LAYER_ID * cache.num_experts + experts
 

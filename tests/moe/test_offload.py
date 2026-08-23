@@ -404,6 +404,32 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
+def test_lru_gpu_cache_accepts_more_routes_than_distinct_experts():
+    """The flashlib plan is query-sized even though its copy output is deduplicated."""
+    import pytest
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the GPU offload cache kernel")
+
+    cache = OffloadMoeCache(
+        num_layers=24,
+        num_experts=32,
+        cache_size=256,
+        device=torch.device("cuda"),
+        quant_format="mxfp4_triton",
+    )
+    expert_ids = (torch.arange(64, dtype=torch.int32, device="cuda") % 32).view(16, 4)
+
+    cache.ensure_experts(0, expert_ids)
+    torch.cuda.synchronize()
+
+    assert int(cache.num_indices.item()) == 32
+    slots = expert_ids.view(2, 32)
+    assert torch.equal(slots[0], slots[1])
+    assert torch.unique(slots[0]).numel() == 32
+
+
 def test_adjust_config_converts_moe_cache_rate_to_cache_size():
     from types import SimpleNamespace
 
@@ -415,7 +441,8 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        # This test covers cache-rate resolution, not an optional attention package.
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
