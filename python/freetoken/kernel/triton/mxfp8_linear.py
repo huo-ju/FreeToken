@@ -130,7 +130,8 @@ def _mxfp8_gemv_splitk_kernel(
     KB32: tl.constexpr = BLOCK_K // 32
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
-    offs_m = tl.arange(0, M_TILE)
+    pid_m = tl.program_id(2)
+    offs_m = pid_m * M_TILE + tl.arange(0, M_TILE)
     m_mask = offs_m < M
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = offs_n < N
@@ -219,7 +220,14 @@ def _gemv(a: torch.Tensor, weight: torch.Tensor, scale_codes: torch.Tensor,
         # rides one weight pass regardless of bucket, so the only cost of a bigger
         # tile is row padding, amortized with proportionally more warps.
         m_tile = max(16, triton.next_power_of_2(M))
-        _mxfp8_gemv_splitk_kernel[(n_tiles, split_k)](
+        from freetoken.utils import triton_turing_compat_enabled
+
+        # A 256-row activation tile alone needs 64 KiB before weight staging.
+        # Split it into multiple programs on SM75 instead of falling back to the
+        # large dequantized-weight transient used by the prefill/cuBLAS path.
+        if triton_turing_compat_enabled(a.device):
+            m_tile = min(m_tile, 64)
+        _mxfp8_gemv_splitk_kernel[(n_tiles, split_k, triton.cdiv(M, m_tile))](
             a, weight, scale_codes, part, M, N, K, n_kb, kb_per,
             a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
             scale_codes.stride(0), scale_codes.stride(1),

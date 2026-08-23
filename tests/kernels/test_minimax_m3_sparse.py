@@ -83,6 +83,27 @@ def ref_select(
     return out
 
 
+def assert_topk_membership_or_tie(
+    got: list[int], want: set[int], scores: torch.Tensor, k: int
+) -> None:
+    """Accept a different block only when it is exactly tied at the top-k cutoff.
+
+    CUDA/Triton and ``torch.topk`` do not promise the same index tie-break. BF16
+    score collisions are possible on SM75, so membership is unique only above
+    the cutoff; equally scored boundary blocks are semantically interchangeable.
+    """
+    got_set = set(got[:k])
+    if got_set == want:
+        return
+    assert len(got_set) == k and all(i >= 0 for i in got_set), (got, want)
+    got_only = sorted(got_set - want)
+    want_only = sorted(want - got_set)
+    assert len(got_only) == len(want_only), (got, want)
+    got_scores = sorted(float(scores[i]) for i in got_only)
+    want_scores = sorted(float(scores[i]) for i in want_only)
+    assert got_scores == want_scores, (got, want, got_scores, want_scores)
+
+
 def ref_sparse_attend(
     q: torch.Tensor,  # [T, HQ, D] queries at q_pos
     k: torch.Tensor,  # [S, KVH, D]
@@ -186,7 +207,7 @@ def test_prefill_index_score_and_topk(kv_len: int, q_len: int, topk: int):
             nb = int(q_pos[t]) // BLK + 1
             k = min(topk, nb)
             got = topk_idx[h, t].tolist()
-            assert set(got[:k]) == ref_sel[h][t], (h, t, got, ref_sel[h][t])
+            assert_topk_membership_or_tie(got, ref_sel[h][t], ref[h, t, :nb], k)
             assert all(i == -1 for i in got[k:]), (h, t, got)
 
 
@@ -227,7 +248,7 @@ def test_decode_index_topk(kv_lens: list[int], topk: int):
         k = min(topk, nb)
         for h in range(H_IDX):
             got = topk_idx[h, i].tolist()
-            assert set(got[:k]) == sel[h][0], (i, h, got, sel[h][0])
+            assert_topk_membership_or_tie(got, sel[h][0], ref[h, 0, :nb], k)
             assert all(x == -1 for x in got[k:]), (i, h, got)
 
 

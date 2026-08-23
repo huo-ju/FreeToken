@@ -37,6 +37,33 @@ def test_arch_helper_semantics(monkeypatch, cc, sm90_sup, sm100_sup, sm90_fam, s
     assert arch.is_sm100_family() is sm100_fam
 
 
+@pytest.mark.parametrize(
+    "value, cc, expected",
+    [
+        (None, (7, 5), True),
+        ("auto", (7, 5), True),
+        (None, (8, 0), False),
+        ("1", (8, 0), True),
+        ("true", None, True),
+        ("0", (7, 5), False),
+        ("off", (7, 5), False),
+    ],
+)
+def test_triton_turing_compat_switch(monkeypatch, value, cc, expected):
+    if value is None:
+        monkeypatch.delenv("FREETOKEN_TRITON_TURING_COMPAT", raising=False)
+    else:
+        monkeypatch.setenv("FREETOKEN_TRITON_TURING_COMPAT", value)
+    monkeypatch.setattr(arch, "_get_torch_cuda_version", lambda: cc)
+    assert arch.triton_turing_compat_enabled() is expected
+
+
+def test_triton_turing_compat_rejects_bad_value(monkeypatch):
+    monkeypatch.setenv("FREETOKEN_TRITON_TURING_COMPAT", "sometimes")
+    with pytest.raises(ValueError, match="FREETOKEN_TRITON_TURING_COMPAT"):
+        arch.triton_turing_compat_enabled()
+
+
 def _engine_config(**overrides):
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig

@@ -18,7 +18,14 @@ def _optin_smem_bytes(device_index: int) -> int:
     return int(getattr(props, "shared_memory_per_block_optin", 0))
 
 
-def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[int, int]:
+def _select_extend_tile(
+    head_dim: int,
+    block_d: int,
+    smem_optin: int,
+    *,
+    split_inputs: bool = False,
+    turing_compat: bool = False,
+) -> tuple[int, int]:
     """Pick ``(BLOCK_M, BLOCK_N)`` for the extend/prefill kernel, shared-memory aware.
 
     Larger tiles run materially faster (~2x for head_dim 512 on H100) but their bf16
@@ -28,6 +35,13 @@ def _select_extend_tile(head_dim: int, block_d: int, smem_optin: int) -> tuple[i
     A100/H100); shrink only where it does not. ``smem_optin == 0`` (unknown) conservatively
     selects the small tiles, i.e. the prior consumer-safe behavior.
     """
+    # The split-input kernel has two independent K/V loops. Triton's Turing
+    # lowering keeps more staging storage live across them than the simple tile
+    # estimate below accounts for, so its otherwise consumer-safe 64x32 tile can
+    # exceed the 64 KiB SM75 per-block limit.
+    if turing_compat and split_inputs and head_dim >= 256:
+        return 16, 16
+
     budget = smem_optin * 0.8  # headroom for scores/acc/alignment/triton scratch
 
     def fits(block_m: int, block_n: int) -> bool:
@@ -394,7 +408,17 @@ def decode_paged_attention(
     # valid_block_h = heads computed per program (drives the grid + head indexing); block_h =
     # power-of-two tile size for tl.arange. They differ only for non-power-of-two GQA groups
     # (e.g. 6), where block_h rounds up and the kernel masks the extra lanes.
-    valid_block_h = min(16, group)
+    from freetoken.utils import triton_turing_compat_enabled
+
+    turing_compat = triton_turing_compat_enabled(q.device)
+    smem_optin = _optin_smem_bytes(q.device.index)
+    # SM75 exposes at most 64 KiB shared memory per block. Grouping multiple
+    # query heads makes Triton's MMA lowering retain enough Q/K/V staging to
+    # exceed that limit for D>=256. One head per program trades launch count for
+    # a substantial reduction in shared memory.
+    low_smem = turing_compat and head_dim >= 256
+    block_h_cap = 1 if low_smem else 16
+    valid_block_h = min(block_h_cap, group)
     block_h = triton.next_power_of_2(valid_block_h)
     block_d = triton.next_power_of_2(head_dim)
     block_dv = triton.next_power_of_2(head_dim)
@@ -428,7 +452,7 @@ def decode_paged_attention(
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=block_d,
         BLOCK_DV=block_dv,
-        BLOCK_N=32,
+        BLOCK_N=16 if low_smem else 32,
         BLOCK_H=block_h,
         VALID_BLOCK_H=valid_block_h,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
@@ -436,7 +460,7 @@ def decode_paged_attention(
         DV=head_dim,
         SLIDING_WINDOW=sliding_window or 0,
         num_warps=4,
-        num_stages=2,
+        num_stages=1 if low_smem else 2,
     )
     _decode_stage2_kernel[(batch, num_q_heads)](
         attn_logits,
@@ -798,11 +822,18 @@ def extend_paged_attention(
     # Tile size is shared-memory bound: keep the fast (large) tiles on GPUs whose opt-in
     # shared memory fits them, shrink on consumer GPUs (sm_89 ~99KB) where the default
     # 128x64 overflows once head_dim >= 256 (e.g. gemma4: SWA 256, full-attention 512).
+    split_inputs = k_extend is not None or v_extend is not None
+    from freetoken.utils import triton_turing_compat_enabled
+
     block_m, block_n = _select_extend_tile(
-        head_dim, block_d, _optin_smem_bytes(q.device.index)
+        head_dim,
+        block_d,
+        _optin_smem_bytes(q.device.index),
+        split_inputs=split_inputs,
+        turing_compat=triton_turing_compat_enabled(q.device),
     )
     grid = (qo_indptr.numel() - 1, num_q_heads, triton.cdiv(max_q_len, block_m))
-    if k_extend is not None or v_extend is not None:
+    if split_inputs:
         assert k_extend is not None and v_extend is not None
         assert k_extend.is_cuda and v_extend.is_cuda
         assert k_extend.dim() == 3 and v_extend.dim() == 3
