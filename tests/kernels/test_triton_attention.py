@@ -614,6 +614,20 @@ def test_select_extend_tile_is_shared_memory_aware(head_dim, smem_optin, expecte
     assert _select_extend_tile(head_dim, block_d, smem_optin) == expected
 
 
+def test_select_extend_tile_reduces_split_inputs_on_sm75():
+    from freetoken.kernel.triton.attention import _select_extend_tile
+
+    assert _select_extend_tile(
+        256, 256, 64 * 1024, split_inputs=True, turing_compat=True
+    ) == (16, 16)
+    assert _select_extend_tile(
+        512, 512, 64 * 1024, split_inputs=True, turing_compat=True
+    ) == (16, 16)
+    assert _select_extend_tile(
+        256, 256, 64 * 1024, split_inputs=True, turing_compat=False
+    ) != (16, 16)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton attention needs CUDA")
 def test_triton_backend_stores_kv_and_matches_reference(monkeypatch):
     from freetoken.attention import AttentionSpec

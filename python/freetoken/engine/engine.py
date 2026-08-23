@@ -1545,6 +1545,14 @@ def _adjust_config(config: EngineConfig):
     is_moe = getattr(model_config, "is_moe", False)
     expert_quant = getattr(model_config, "expert_quant", "none")
 
+    from freetoken.utils import triton_turing_compat_enabled
+
+    if triton_turing_compat_enabled():
+        logger.info_rank0(
+            "Triton-Turing compatibility mode is enabled "
+            "(auto on SM75; set FREETOKEN_TRITON_TURING_COMPAT=0 to disable)"
+        )
+
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
         # is worse than inert -- engine init would build an expert cache for a model that has

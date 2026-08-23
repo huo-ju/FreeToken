@@ -23,6 +23,31 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[accel]"
 ```
 
+### Turing / SM75
+
+Official Triton no longer supports Turing. Install the community fork in the same
+environment before installing FreeToken:
+
+```bash
+git clone https://github.com/Chennesxu/triton-turing.git ../triton-turing
+uv pip install -e ../triton-turing
+uv pip install --no-deps -e ../triton-turing/python/triton_kernels
+uv pip install -e ".[accel]"
+```
+
+FreeToken automatically enables its conservative SM75 launch configurations when the
+active GPU has compute capability 7.5. The tri-state switch is useful for diagnosis:
+
+```bash
+export FREETOKEN_TRITON_TURING_COMPAT=auto  # default: enabled only on SM75
+export FREETOKEN_TRITON_TURING_COMPAT=1     # force-enable
+export FREETOKEN_TRITON_TURING_COMPAT=0     # disable and use upstream launch configs
+```
+
+The switch controls FreeToken's kernel workarounds; it does not dynamically replace the
+installed `triton` package. Turing processes still require `triton-turing` in their Python
+environment.
+
 ## Verify
 
 ```bash
