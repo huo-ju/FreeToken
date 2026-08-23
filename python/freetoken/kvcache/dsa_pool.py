@@ -4,7 +4,7 @@
 per-token latent ``ckv (kv_lora_rank) | kpe (qk_rope_head_dim)`` -- there is no
 separate V (``v_cache`` aliases ``k_cache``, same convention as dsv4_paged_pool's
 single-latent tiers). ``DSAKVCache`` extends it with the DeepSeek-Sparse-Attention
-index-key slab: one ``index_head_dim``-wide bf16 row per token per full-indexer
+index-key slab: one ``index_head_dim``-wide 16-bit row per token per full-indexer
 layer, addressed by the SAME physical rows as the latent slab (page_size == 1), and
 ``rebuild`` resizes BOTH slabs atomically so the allocator can never hand out a slot
 one slab has and the other lacks.
@@ -129,7 +129,7 @@ class MLAKVCache(BaseKVCachePool):
 
 class DSAKVCache(MLAKVCache):
     """MLA latent pool + the DSA index-key slab (one row per token per full-indexer
-    layer, bf16, slot order = the backend's full-layer order)."""
+    layer, activation dtype, slot order = the backend's full-layer order)."""
 
     def __init__(
         self,
@@ -150,13 +150,13 @@ class DSAKVCache(MLAKVCache):
         # Both slabs in one allocation step: rebuild can never leave the pool with a
         # grown latent slab and a stale index slab (the OOB class this type exists for).
         super()._alloc(num_pages)
-        # bf16 == the 2 bytes/token/layer the KV cost model budgets for this slab
-        # (cache_status._kv_cost_model); keep the two in lockstep.
+        # Both BF16 and FP16 match the 2 bytes/token/layer budgeted by the KV cost
+        # model. SM75 uses FP16 so the indexer never reintroduces BF16 activations.
         self._index_k_buffer = torch.zeros(
             self._num_index_layers,
             num_pages * self._page_size,
             self._index_head_dim,
-            dtype=torch.bfloat16,
+            dtype=self._dtype,
             device=self._device,
         )
 

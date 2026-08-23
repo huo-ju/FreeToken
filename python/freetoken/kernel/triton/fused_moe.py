@@ -284,7 +284,7 @@ def fused_moe_kernel(
 
         # We accumulate along the K dimension.
 
-        accumulator += tl.dot(a, b)
+        accumulator += tl.dot(a, b, out_dtype=tl.float32)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk

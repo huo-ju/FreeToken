@@ -13,6 +13,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 
 H_IDX, D_IDX, ROPE_DIM, Q_LORA, HIDDEN = 32, 128, 64, 256, 512
 THETA = 8_000_000.0
+ACT_DTYPE = (
+    torch.float16
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (7, 5)
+    else torch.bfloat16
+)
 
 
 def _hf_indexer(seq: int, topk: int):
@@ -32,15 +37,15 @@ def _hf_indexer(seq: int, topk: int):
         q_lora_rank = Q_LORA
 
     torch.manual_seed(7)
-    idx = tr.GlmMoeDsaIndexer(Cfg(), layer_idx=0).cuda().to(torch.bfloat16)
-    x = torch.randn(1, seq, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    q_resid = torch.randn(1, seq, Q_LORA, device="cuda", dtype=torch.bfloat16)
+    idx = tr.GlmMoeDsaIndexer(Cfg(), layer_idx=0).cuda().to(ACT_DTYPE)
+    x = torch.randn(1, seq, HIDDEN, device="cuda", dtype=ACT_DTYPE)
+    q_resid = torch.randn(1, seq, Q_LORA, device="cuda", dtype=ACT_DTYPE)
     pos = torch.arange(seq, device="cuda")
     # cos/sin exactly as the HF rotary: freqs over ROPE_DIM, cat(freqs, freqs)
     inv = 1.0 / (THETA ** (torch.arange(0, ROPE_DIM, 2, device="cuda", dtype=torch.float) / ROPE_DIM))
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
-    cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
+    cos, sin = emb.cos()[None].to(ACT_DTYPE), emb.sin()[None].to(ACT_DTYPE)
     ref_topk = idx(x, q_resid, (cos, sin), None, pos[None])  # [1, S, topk]
     return idx, x, q_resid, pos, ref_topk
 
@@ -130,8 +135,8 @@ def test_sparse_kernel_equals_dense_when_all_selected():
 
     torch.manual_seed(0)
     h, dv, dr, n = 40, 512, 64, 977
-    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=torch.bfloat16)
-    pool = torch.randn(n + 13, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=ACT_DTYPE)
+    pool = torch.randn(n + 13, dv + dr, device="cuda", dtype=ACT_DTYPE) * 0.5
     rows = torch.randperm(n + 13, device="cuda")[:n].to(torch.int32)
     scale = (dv + dr) ** -0.5
 
@@ -156,11 +161,11 @@ def test_identity_selection_equals_topk_selection_at_short_kv():
 
     torch.manual_seed(1)
     h, dv, dr, kv, topk = 8, 64, 16, 250, 512  # kv < topk
-    pool = torch.randn(1024, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    pool = torch.randn(1024, dv + dr, device="cuda", dtype=ACT_DTYPE) * 0.5
     rows = torch.randperm(1024, device="cuda")[:kv].to(torch.int32)
     m = 6
     positions = torch.arange(kv - m, kv, device="cuda")
-    q = torch.randn(1, m, h, dv + dr, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, m, h, dv + dr, device="cuda", dtype=ACT_DTYPE)
     scale = (dv + dr) ** -0.5
 
     # identity: shared row list broadcast over queries, causal counts
@@ -191,8 +196,8 @@ def test_decode_logits_edges():
 
     torch.manual_seed(2)
     H, D, W = 16, 128, 512
-    pool = torch.randn(2048, D, device="cuda", dtype=torch.bfloat16)
-    q = torch.randn(3, H, D, device="cuda", dtype=torch.bfloat16)
+    pool = torch.randn(2048, D, device="cuda", dtype=ACT_DTYPE)
+    q = torch.randn(3, H, D, device="cuda", dtype=ACT_DTYPE)
     w = torch.randn(3, H, device="cuda").abs()
     rows = torch.randint(0, 2048, (3, W), device="cuda", dtype=torch.int32)
     rows[0, 100:] = 987654  # garbage past live: must never be dereferenced
@@ -215,10 +220,10 @@ def test_splitk_matches_single_program():
 
     torch.manual_seed(3)
     h, dv, dr, K = 40, 512, 64, 2048
-    pool = torch.randn(8192, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    pool = torch.randn(8192, dv + dr, device="cuda", dtype=ACT_DTYPE) * 0.5
     idx = torch.randperm(8192, device="cuda")[:K].to(torch.int32).view(1, 1, K)
     idx[0, 0, 1500:] = -1
-    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 1, h, dv + dr, device="cuda", dtype=ACT_DTYPE)
     cnt = torch.tensor([[1500]], device="cuda", dtype=torch.int32)
     o_single = glm_dsa_sparse_attn(q, pool, idx, 0.07, counts=cnt, force_splits=0)
     o_split = glm_dsa_sparse_attn(q, pool, idx, 0.07, counts=cnt, force_splits=16)
@@ -238,10 +243,10 @@ def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64
     ctx = Context(page_size=1)
     ctx.page_table = torch.zeros(4, pages, dtype=torch.int32, device="cuda")
     if dsa:
-        ctx.kv_cache = DSAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"),
+        ctx.kv_cache = DSAKVCache(latent, 2, pages, 1, ACT_DTYPE, torch.device("cuda"),
                                   index_head_dim=idx_dim, num_index_layers=1)
     else:
-        ctx.kv_cache = MLAKVCache(latent, 2, pages, 1, torch.bfloat16, torch.device("cuda"))
+        ctx.kv_cache = MLAKVCache(latent, 2, pages, 1, ACT_DTYPE, torch.device("cuda"))
     set_global_ctx(ctx)
     args = SimpleNamespace(
         kv_lora_rank=dv, qk_rope_head_dim=latent - dv, qk_head_dim=latent,
@@ -282,11 +287,11 @@ def test_backend_ragged_prefill_identity_and_selection():
     # pre-extend history (latent + index keys) for both requests, both layers
     hist_loc = torch.cat([torch.arange(0, 32), torch.arange(40, 128)]).cuda()
     n_hist = hist_loc.numel()
-    hist_ckv = torch.randn(n_hist, dv, device="cuda", dtype=torch.bfloat16)
-    hist_kpe = torch.randn(n_hist, dr, device="cuda", dtype=torch.bfloat16)
+    hist_ckv = torch.randn(n_hist, dv, device="cuda", dtype=ACT_DTYPE)
+    hist_kpe = torch.randn(n_hist, dr, device="cuda", dtype=ACT_DTYPE)
     for lid in (0, 1):  # identical content on both layers (leader/follower comparison)
         pool.store_kv(hist_ckv, hist_kpe, hist_loc, lid)
-    pool.store_index_k(torch.randn(n_hist, idx_d, device="cuda", dtype=torch.bfloat16),
+    pool.store_index_k(torch.randn(n_hist, idx_d, device="cuda", dtype=ACT_DTYPE),
                        hist_loc, 0)
 
     batch = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
@@ -294,12 +299,12 @@ def test_backend_ragged_prefill_identity_and_selection():
     backend.prepare_metadata(batch)
 
     t = 20
-    q_nope = torch.randn(t, h, dv, device="cuda", dtype=torch.bfloat16)
-    q_pe = torch.randn(t, h, dr, device="cuda", dtype=torch.bfloat16)
-    c_kv = torch.randn(t, dv, device="cuda", dtype=torch.bfloat16)
-    k_rope = torch.randn(t, dr, device="cuda", dtype=torch.bfloat16)
-    qkw = (torch.randn(t, idx_h, idx_d, device="cuda", dtype=torch.bfloat16),
-           torch.randn(t, idx_d, device="cuda", dtype=torch.bfloat16),
+    q_nope = torch.randn(t, h, dv, device="cuda", dtype=ACT_DTYPE)
+    q_pe = torch.randn(t, h, dr, device="cuda", dtype=ACT_DTYPE)
+    c_kv = torch.randn(t, dv, device="cuda", dtype=ACT_DTYPE)
+    k_rope = torch.randn(t, dr, device="cuda", dtype=ACT_DTYPE)
+    qkw = (torch.randn(t, idx_h, idx_d, device="cuda", dtype=ACT_DTYPE),
+           torch.randn(t, idx_d, device="cuda", dtype=ACT_DTYPE),
            torch.randn(t, idx_h, device="cuda").abs())
 
     o0 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch, indexer_qkw=qkw)

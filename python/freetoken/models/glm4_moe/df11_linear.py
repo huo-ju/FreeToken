@@ -10,15 +10,19 @@ from freetoken.layers.base import _concat_prefix
 # One decode scratch per device, shared by every LinearDF11 (decodes are sequential, so the
 # weight is materialized, consumed by the GEMM, then overwritten by the next projection). It
 # grows to the largest projection during warmup and is then stable -> CUDA-graph safe.
-_SCRATCH: dict[torch.device, torch.Tensor] = {}
+_SCRATCH: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
 
 
-def _scratch(out_features: int, in_features: int, device: torch.device) -> torch.Tensor:
+def _scratch(
+    out_features: int, in_features: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
     n = out_features * in_features
-    buf = _SCRATCH.get(device)
+    key = (device, dtype)
+    buf = _SCRATCH.get(key)
     if buf is None or buf.numel() < n:
-        buf = torch.empty(n, dtype=torch.int16, device=device)
-        _SCRATCH[device] = buf
+        storage_dtype = torch.int16 if dtype == torch.bfloat16 else dtype
+        buf = torch.empty(n, dtype=storage_dtype, device=device)
+        _SCRATCH[key] = buf
     return buf[:n].view(out_features, in_features)
 
 
@@ -32,7 +36,8 @@ class LinearDF11(BaseOP):
     """Replicated (TP=1) linear whose weight is stored losslessly as DF11 (compressed BF16).
 
     The forward decodes the weight **bit-for-bit** into a shared scratch buffer and runs a
-    normal bf16 GEMM. This reproduces GLM-4's intended full-precision attention -- NVIDIA's
+    normal 16-bit GEMM. SM75 converts the decoded BF16 storage directly to FP16; newer
+    architectures retain BF16. This reproduces GLM-4's intended full-precision attention -- NVIDIA's
     NVFP4 recipe deliberately keeps every ``self_attn`` (qkvo) out of quantization -- while
     fitting a 32 GB VRAM target (~10.7 bits/weight vs bf16's 16, and lossless unlike fp8).
 
@@ -51,7 +56,13 @@ class LinearDF11(BaseOP):
         self.bitstream = torch.empty(0, dtype=torch.int32)
         self.chunk_start = torch.empty(0, dtype=torch.int32)
         self.lut = torch.empty(0, dtype=torch.int32)
-        self.bias = torch.empty(out_features, dtype=torch.bfloat16) if has_bias else None
+        default_dtype = torch.get_default_dtype()
+        compute_dtype = (
+            default_dtype
+            if default_dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
+        self.bias = torch.empty(out_features, dtype=compute_dtype) if has_bias else None
 
     def _bundle(self) -> dict:
         g = self.chunk_start.numel()  # number of chunks (interleave stride)
@@ -65,8 +76,8 @@ class LinearDF11(BaseOP):
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out16 = _scratch(self.out_features, self.in_features, x.device)
-        w = df11_decompress(self._bundle(), out=out16)  # bit-exact bf16 [out, in]
+        out16 = _scratch(self.out_features, self.in_features, x.device, x.dtype)
+        w = df11_decompress(self._bundle(), out=out16, dtype=x.dtype)
         return F.linear(x, w, self.bias)
 
     def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:

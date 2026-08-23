@@ -48,6 +48,13 @@ The switch controls FreeToken's kernel workarounds; it does not dynamically repl
 installed `triton` package. Turing processes still require `triton-turing` in their Python
 environment.
 
+SM75 has FP16 Tensor Cores but no native BF16 Tensor Core mode. FreeToken therefore treats
+BF16 as a checkpoint/storage dtype on Turing and serves it with **FP16 weights and
+activations plus FP32 accumulation**. This conversion is automatic even when
+`--dtype=bfloat16` was requested explicitly; it avoids the much slower software preservation of
+BF16 arithmetic semantics. `FREETOKEN_TRITON_TURING_COMPAT=0` disables launch workarounds,
+not this hardware dtype policy.
+
 ## Verify
 
 ```bash

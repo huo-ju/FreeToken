@@ -467,9 +467,10 @@ def mxfp4_splitk_gemv_triton(
 ) -> torch.Tensor:
     """Split-K expert GEMV over MXFP4 weights stored transposed as [E, K//2, N]
     (blocks) and [E, K//32, N] (scales). ``x`` is [routes, K] (or broadcast via
-    stride_xe=0); ``expert_ids`` is [routes]. Returns [routes, N] bf16.
+    stride_xe=0); ``expert_ids`` is [routes]. Returns [routes, N] in ``x.dtype``.
     """
     import triton
+    import triton.language as tl
 
     from .triton.mxfp4_moe import mxfp4_splitk_gemv_kernel, mxfp4_splitk_reduce_kernel
 
@@ -477,7 +478,9 @@ def mxfp4_splitk_gemv_triton(
     if partial is None:
         partial = torch.empty(routes * num_splits, N, dtype=torch.float32, device=x.device)
     if out is None:
-        out = torch.empty(routes, N, dtype=torch.bfloat16, device=x.device)
+        out = torch.empty(routes, N, dtype=x.dtype, device=x.device)
+    if out.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"MXFP4 output must be fp16, bf16 or fp32, got {out.dtype}")
     has_bias = bias is not None and bias.numel() > 0
     bias_arg = bias if has_bias else x
     bias_stride = bias.stride(0) if has_bias else 0
@@ -499,6 +502,11 @@ def mxfp4_splitk_gemv_triton(
     mxfp4_splitk_reduce_kernel[rgrid](
         partial, out, N, expert_wts if has_wts else x,
         HAS_EXPERT_WTS=has_wts, NUM_K_SPLITS=num_splits, BLOCK_N=block_n,  # type: ignore
+        OUT={
+            torch.float16: tl.float16,
+            torch.bfloat16: tl.bfloat16,
+            torch.float32: tl.float32,
+        }[out.dtype],  # type: ignore
         num_warps=num_warps,
     )
     return out

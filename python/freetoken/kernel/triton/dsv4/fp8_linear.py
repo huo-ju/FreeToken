@@ -74,7 +74,7 @@ def _act_quant_fp8_kernel(
     if e4m3_native_cx():
         y = y.to(tl.float8e4nv)
     else:
-        y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
+        y = round_e4m3(y)  # e4m3-grid values into the wrapper's native 16-bit buffer
     tl.store(
         y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yn,
         y, mask=m_mask[:, None],
@@ -86,7 +86,7 @@ def _act_quant_fp8_kernel(
 def act_quant_fp8(x: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference ``act_quant`` (ue8m0): returns ``(x_fp8 [M,K], scale_codes [M,K//block])``
     where ``scale = 2**(code-127)``. Without native fp8 the quantized values are the
-    same e4m3-grid points held in bf16 (exactly representable)."""
+    same e4m3-grid points held in a native 16-bit dtype (exactly representable)."""
     *lead, K = x.shape
     assert K % block == 0, (K, block)
     x2d = x.reshape(-1, K).contiguous()
@@ -244,8 +244,8 @@ def _fp8_act_gemm_kernel(
         if e4m3_native_cx():
             p = tl.dot(a, tl.trans(w), out_dtype=tl.float32)
         else:
-            # bf16 dot on the same e4m3 grid: operands exact in bf16, fp32 acc
-            p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(tl.bfloat16)), out_dtype=tl.float32)
+            # Exact e4m3 grid in FP16 on SM75 or BF16 on SM80/86; FP32 acc.
+            p = tl.dot(a, tl.trans(e4m3_u8_to_f32(w).to(a.dtype)), out_dtype=tl.float32)
         sa_code = tl.load(sa_ptr + offs_m * stride_sam + k * stride_sak, mask=m_mask, other=0)
         sca = tl.exp2(sa_code.to(tl.float32) - 127.0)            # [BLOCK_M]
         sb_code = tl.load(sb_ptr + pid_n * stride_sbn + k * stride_sbk)

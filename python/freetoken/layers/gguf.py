@@ -105,6 +105,16 @@ class GGUFEmbedding(BaseOP):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self._quant_type = quant_type
+        # Model construction runs under engine.torch_dtype(config.dtype). Keep
+        # that resolved compute dtype for lookup-time dequantization; consulting
+        # torch.get_default_dtype() in forward would see the restored process
+        # default (normally fp32). On SM75 this is FP16 by policy.
+        default_dtype = torch.get_default_dtype()
+        self._compute_dtype = (
+            default_dtype
+            if default_dtype in (torch.float16, torch.bfloat16)
+            else torch.bfloat16
+        )
         self.qweight = torch.empty(
             num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8
         )
@@ -116,7 +126,13 @@ class GGUFEmbedding(BaseOP):
 
         flat = x.flatten()
         rows = self.qweight.index_select(0, flat)  # [n, row_bytes] packed
-        y = ggml_dequantize(rows, self._quant_type, flat.shape[0], self.embedding_dim, torch.bfloat16)
+        y = ggml_dequantize(
+            rows,
+            self._quant_type,
+            flat.shape[0],
+            self.embedding_dim,
+            self._compute_dtype,
+        )
         y = y.view(*x.shape, self.embedding_dim)
         if self._embed_scale is not None:
             if self._embed_scale_t is None:

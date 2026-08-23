@@ -251,7 +251,7 @@ def _decode_grouped_stage1_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
-            scores = tl.dot(q, k) * sm_scale
+            scores = tl.dot(q, k, out_dtype=tl.float32) * sm_scale
             scores = tl.where(mask_h[:, None] & mask_n[None, :], scores, -float("inf"))
 
             v = tl.load(
@@ -263,7 +263,9 @@ def _decode_grouped_stage1_kernel(
             m_new = tl.maximum(tl.max(scores, axis=1), m_i)
             alpha = tl.exp(m_i - m_new)
             p = tl.exp(scores - m_new[:, None])
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(v.dtype), v, out_dtype=tl.float32
+            )
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -577,7 +579,7 @@ def _extend_attention_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
-            scores = tl.dot(q.to(k.dtype), k) * sm_scale
+            scores = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -594,7 +596,9 @@ def _extend_attention_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(v.dtype), v, out_dtype=tl.float32
+            )
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -704,7 +708,7 @@ def _extend_attention_split_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
-            scores = tl.dot(q.to(k.dtype), k) * sm_scale
+            scores = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -721,7 +725,9 @@ def _extend_attention_split_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(v.dtype), v, out_dtype=tl.float32
+            )
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 
@@ -750,7 +756,7 @@ def _extend_attention_split_kernel(
                 mask=mask_n[None, :] & mask_d[:, None],
                 other=0.0,
             )
-            scores = tl.dot(q.to(k.dtype), k) * sm_scale
+            scores = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale
             scores = tl.where(final_mask, scores, -float("inf"))
 
             row_max = tl.max(scores, axis=1)
@@ -767,7 +773,9 @@ def _extend_attention_split_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(v.dtype), v, out_dtype=tl.float32
+            )
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_new
 

@@ -298,6 +298,13 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
+        from freetoken.utils import is_sm75_device
+
+        if is_sm75_device(self.device):
+            # Keep cuBLAS on the same FP16-input / FP32-accumulate contract as
+            # the Triton kernels. PyTorch otherwise permits reduced-precision
+            # intermediate reductions for some FP16 GEMM algorithms.
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
@@ -1100,11 +1107,29 @@ def _adjust_config(config: EngineConfig):
 
     from freetoken.utils import triton_turing_compat_enabled
 
-    if triton_turing_compat_enabled():
+    turing_compat = triton_turing_compat_enabled()
+    if turing_compat:
         logger.info_rank0(
             "Triton-Turing compatibility mode is enabled "
             "(auto on SM75; set FREETOKEN_TRITON_TURING_COMPAT=0 to disable)"
         )
+
+    # SM75 Tensor Cores have no native BF16 input mode. Normalize at the single
+    # engine choke point shared by the CLI and programmatic EngineConfig users so
+    # model parameters, activations and KV/state pools all agree on FP16. This is
+    # a hardware policy, deliberately independent of the compatibility escape
+    # hatch above; disabling launch workarounds must not re-enable BF16 emulation.
+    from freetoken.utils import is_sm75_device, sm75_activation_dtype
+
+    requested_dtype = getattr(config, "dtype", None)
+    resolved_dtype = sm75_activation_dtype(requested_dtype)
+    if resolved_dtype != requested_dtype:
+        override("dtype", resolved_dtype)
+        logger.warning_rank0(
+            "SM75 has no native BF16 Tensor Cores: serving BF16 checkpoint data "
+            "with FP16 weights/activations and FP32 accumulation."
+        )
+    sm75 = is_sm75_device()
 
     if not is_moe:
         # A dense model has no routed experts: the MoE knobs are inert, and the offload family
@@ -1180,7 +1205,7 @@ def _adjust_config(config: EngineConfig):
             "compute only (the index slab budgets 2 bytes/token); use bfloat16 "
             "or float16."
         )
-    if _dtype == torch.float16 and "mxfp8" in (
+    if _dtype == torch.float16 and not sm75 and "mxfp8" in (
         getattr(model_config, "attn_quant", "none"),
         getattr(model_config, "dense_quant", "none"),
     ):
@@ -1233,6 +1258,30 @@ def _adjust_config(config: EngineConfig):
             "and let every layer decode on the GPU offload path instead."
         )
 
+    # The CPU executor currently has a BF16 ABI: its activation/result staging
+    # buffers are BF16, plain expert banks must be BF16, and MXFP4 biases are
+    # required to be BF16.  SM75, however, normalizes the model and all GPU-side
+    # activation state to FP16 above.  Auto-upgrading to hybrid from a bandwidth
+    # profile would therefore either reintroduce BF16 semantics or fail after the
+    # FP16 banks have loaded.  Keep the Turing policy honest until the CPU
+    # executor gains an explicitly validated FP16 ABI.
+    if (
+        is_moe
+        and sm75
+        and (config.moe_backend in ("cpu", "hybrid") or config.moe_cpu_layers)
+    ):
+        asked = (
+            f"--moe-cpu-layers={config.moe_cpu_layers!r}"
+            if config.moe_backend not in ("cpu", "hybrid")
+            else f"--moe-backend {config.moe_backend!r}"
+        )
+        raise ValueError(
+            f"{asked} is unsupported on SM75: the Turing backend requires FP16 "
+            "activations/weights with FP32 accumulation, while the CPU MoE "
+            "executor currently has a BF16 activation/bank ABI. Use "
+            "--moe-backend offload."
+        )
+
     if is_moe and config.moe_backend == "auto":
         # A MoE model always defaults to the offload family: experts stream from pinned host
         # banks into an auto-sized GPU slot cache, which is the only default that serves a model
@@ -1254,7 +1303,13 @@ def _adjust_config(config: EngineConfig):
         from freetoken.moe.bench_profile import load_backend_recommendation
 
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        if load_backend_recommendation(bench_fmt, gpu_name=gpu_name) == "hybrid":
+        recommendation = load_backend_recommendation(bench_fmt, gpu_name=gpu_name)
+        if sm75 and recommendation == "hybrid":
+            logger.info_rank0(
+                "benchbw profile recommends hybrid, but SM75 requires the FP16 "
+                "GPU offload path and the CPU MoE executor is BF16-only; staying on offload"
+            )
+        elif recommendation == "hybrid":
             from freetoken.moe.cpu_executor import compiled_extension_supports
 
             _act = getattr(model_config, "hidden_act", "silu")

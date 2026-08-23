@@ -4,6 +4,8 @@ from .arch import (
     is_sm90_supported,
     is_sm100_family,
     is_sm100_supported,
+    is_sm75_device,
+    sm75_activation_dtype,
     triton_turing_compat_enabled,
 )
 from .hf import (
@@ -40,6 +42,8 @@ __all__ = [
     "is_sm90_supported",
     "is_sm100_family",
     "is_sm100_supported",
+    "is_sm75_device",
+    "sm75_activation_dtype",
     "triton_turing_compat_enabled",
     "call_if_main",
     "div_even",
