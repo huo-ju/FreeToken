@@ -104,6 +104,71 @@ def test_split_count_follows_shape():
     assert split_count(b=1, m=1, h=H, topk=N_WINDOW + 8, device=dev) == 0
 
 
+def test_fp16_native_query_and_pools():
+    """SM75 serves DSV4 in FP16; query and persistent KV must follow that dtype."""
+    g = torch.Generator(device="cuda").manual_seed(29)
+    q, idx, counts = _build(b=1, m=2, n_cmp_cols=8, cmp_valid=[8], seed=29)
+    q = q.to(torch.float16)
+    win = torch.randn(
+        N_WIN_SLOTS, D, device="cuda", dtype=torch.float16, generator=g
+    )
+    cmp = torch.randn(N_CMP, D, device="cuda", dtype=torch.float16, generator=g)
+    sink = torch.randn(H, device="cuda", dtype=torch.float32, generator=g)
+
+    got = sparse_attn_paged(
+        q, win, cmp, sink, idx, N_WINDOW, D ** -0.5, cmp_counts=counts
+    )
+    ref = _reference(q, win, cmp, sink, idx, N_WINDOW, D ** -0.5, counts)
+    assert got.dtype == torch.float16
+    torch.testing.assert_close(got.float(), ref, **TOL)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="exercises the SM75 shared-memory launch geometry",
+)
+@pytest.mark.parametrize("m", MS)
+def test_sm75_real_dsv4_geometry_fp16(m):
+    """The checkpoint uses H=64/D=512; cover both decode split-k and prefill launches.
+
+    This is intentionally not a reduced unit-test shape: the old BLOCK_T=32, num_stages=2
+    launch compiled at D=64 but requested 100416 bytes at D=512 on a 65536-byte TITAN RTX.
+    """
+    real_d, real_h = 512, 64
+    n_win_slots, n_cmp_slots = 96, 256
+    n_window, n_cmp_cols = 32, 128
+    g = torch.Generator(device="cuda").manual_seed(31 + m)
+    q = torch.randn(
+        1, m, real_h, real_d, device="cuda", dtype=torch.float16, generator=g
+    )
+    win = torch.randn(
+        n_win_slots, real_d, device="cuda", dtype=torch.float16, generator=g
+    )
+    cmp = torch.randn(
+        n_cmp_slots, real_d, device="cuda", dtype=torch.float16, generator=g
+    )
+    sink = torch.randn(real_h, device="cuda", dtype=torch.float32, generator=g)
+    idx = torch.empty((1, m, n_window + n_cmp_cols), device="cuda", dtype=torch.int32)
+    idx[..., :n_window] = torch.randint(
+        0, n_win_slots, (1, m, n_window), device="cuda", dtype=torch.int32, generator=g
+    )
+    idx[..., n_window:] = torch.randint(
+        0, n_cmp_slots, (1, m, n_cmp_cols), device="cuda", dtype=torch.int32, generator=g
+    )
+    counts = torch.full((1, m), n_cmp_cols, device="cuda", dtype=torch.int32)
+    scale = real_d ** -0.5
+
+    if m == 1:
+        assert split_count(1, m, real_h, idx.shape[-1], q.device) > 1
+    else:
+        assert split_count(1, m, real_h, idx.shape[-1], q.device) == 0
+    got = sparse_attn_paged(q, win, cmp, sink, idx, n_window, scale, cmp_counts=counts)
+    ref = _reference(q, win, cmp, sink, idx, n_window, scale, counts)
+
+    assert got.dtype == torch.float16
+    torch.testing.assert_close(got.float(), ref, **TOL)
+
+
 @pytest.mark.parametrize("m", MS)
 def test_no_counts(pools, m):
     """Without counts the kernel walks the whole buffer; -1 columns contribute nothing."""

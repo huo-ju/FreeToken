@@ -109,6 +109,17 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _gpu_only_layers(value: str) -> int:
+        if value.strip().lower() == "auto":
+            return -1
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be 'auto' or a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be 'auto' or >= 0")
+        return n
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -512,6 +523,19 @@ def parse_args(
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
         help="The unified MoE cache eviction policy.",
+    )
+
+    parser.add_argument(
+        "--moe-gpu-only-layers",
+        type=_gpu_only_layers,
+        default=ServerArgs.moe_gpu_only_layers,
+        metavar="auto|N",
+        help=(
+            "Keep complete expert layers exclusively in protected GPU slots and discard "
+            "their host backing while loading. 'auto' (default) uses every complete layer "
+            "that fits after the dynamic-cache/prefill floor; 0 disables it. Currently "
+            "available for DeepSeek-V4 FP4 with the original safetensors checkpoint."
+        ),
     )
 
     parser.add_argument(

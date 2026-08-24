@@ -8,8 +8,9 @@ Four buffer families, sized from a budget (the cost model) not ``num_requests``:
 * ``state_ring[L]``   -- ratio>0 layers; the per-window-page compress-state ring
   (fp32, ``kv|score`` split), with index ``-1`` a permanent scratch slot.
 
-The KV/compressed/indexer pools are bf16 (the fp8/fp4 quant is an in-place round-trip already
-baked into the bf16 value, so ``index_select`` staging is byte-exact); only the compress-state
+The KV/compressed/indexer pools use the model's native 16-bit compute dtype (BF16 on
+Ampere+, FP16 on SM75). The fp8/fp4 quant is an in-place round-trip already baked into
+that value, so ``index_select`` staging is byte-exact; only the compress-state
 ring is fp32.
 
 ``state_loc`` is DERIVED from a window slot, never stored:
@@ -161,7 +162,9 @@ class DSV4PagedKVCache(BaseKVCachePool):
         P: int = 128,
         n_scratch: int = 1,
     ) -> None:
-        assert dtype == torch.bfloat16, "KV pools are bf16 (fp4/fp8 is an in-place round-trip)"
+        assert dtype in (torch.bfloat16, torch.float16), (
+            "DSV4 KV pools require a native 16-bit dtype (bfloat16 or float16)"
+        )
         self.args = args
         self.sizes = sizes
         self._device = device

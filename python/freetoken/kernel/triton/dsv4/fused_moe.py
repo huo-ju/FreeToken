@@ -166,6 +166,30 @@ def _fp4_bf16_bits(nib, shift):
 
 
 @triton.jit
+def _fp4_fp16_bits(nib, shift):
+    """E2M1 nibble [tile] + e8m0 exponent-field shift -> fp16 bit pattern.
+
+    The grouped prefill kernel used to assemble BF16 bits unconditionally and
+    bitcast those same 16 bits to the activation dtype.  That is valid for the
+    normal BF16 path, but on SM75 the activation dtype is FP16: interpreting a
+    BF16 exponent field as FP16 makes the routed-expert weights hundreds of
+    times too large as soon as prefill switches to the grouped kernel.
+
+    DSV4's expert scale range keeps every non-zero scaled E2M1 value normal in
+    FP16.  Assembling the native exponent and mantissa is therefore exact
+    (including signed zero) and keeps the grouped path free of a LUT gather /
+    exp2.
+    """
+    sign = (nib & 0x8) << 12
+    e = (nib >> 1) & 0x3
+    m = nib & 0x1
+    # E2M1 subnormal code 1 is 0.5 (FP16 exponent 14).  Normal E2M1 codes use
+    # exponent 14+e and the one mantissa bit becomes FP16 mantissa bit 9.
+    mag = tl.where(e == 0, m * (0x3800 + shift), ((14 + e) << 10) + (m << 9) + shift)
+    return sign + mag
+
+
+@triton.jit
 def _prefill_dsfp4_moe_kernel(
     a_ptr,             # [M, K] activations (compute dtype, FP8 round-tripped)
     packed_ptr,        # [S, N, K // 2] uint8
@@ -189,6 +213,7 @@ def _prefill_dsfp4_moe_kernel(
     GROUP_SIZE_M: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
+    FP16_COMPUTE: tl.constexpr,
     compute_type: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -250,13 +275,23 @@ def _prefill_dsfp4_moe_kernel(
             mask=(offs_n[:, None] < N) & (sblk[None, :] * 32 < K),
             other=127,
         )
-        shift = (codes.to(tl.int32) - 127) << 7  # [BN, NSB] exponent-field add
+        # Assemble the weight in the *native activation dtype*.  BF16 and FP16
+        # are both 16-bit, but their exponent/mantissa fields are not compatible.
+        shift_bits: tl.constexpr = 10 if FP16_COMPUTE else 7
+        shift = (codes.to(tl.int32) - 127) << shift_bits  # [BN, NSB] exponent-field add
         shift = tl.reshape(
             tl.broadcast_to(shift[:, :, None], (BLOCK_SIZE_N, NSB, 16)), (BLOCK_SIZE_N, KB)
         )
-        bits = tl.interleave(
-            _fp4_bf16_bits(packed & 0x0F, shift), _fp4_bf16_bits((packed >> 4) & 0x0F, shift)
-        )
+        if FP16_COMPUTE:
+            bits = tl.interleave(
+                _fp4_fp16_bits(packed & 0x0F, shift),
+                _fp4_fp16_bits((packed >> 4) & 0x0F, shift),
+            )
+        else:
+            bits = tl.interleave(
+                _fp4_bf16_bits(packed & 0x0F, shift),
+                _fp4_bf16_bits((packed >> 4) & 0x0F, shift),
+            )
         b = tl.reshape(bits, (BLOCK_SIZE_N, BLOCK_SIZE_K)).to(tl.uint16).to(compute_type, bitcast=True)
         accumulator += tl.dot(a, tl.trans(b))
         a_ptrs += BLOCK_SIZE_K * stride_ak

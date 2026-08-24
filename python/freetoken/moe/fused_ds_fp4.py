@@ -154,6 +154,7 @@ def _grouped_prefill(
     mul_routed_weight: bool,
     cfg: dict,
 ) -> None:
+    assert a.dtype in (torch.bfloat16, torch.float16), a.dtype
     N = packed_cache.shape[1]
     K = packed_cache.shape[2] * 2
     EM = sorted_ids.shape[0]
@@ -175,6 +176,7 @@ def _grouped_prefill(
         GROUP_SIZE_M=cfg["GROUP_SIZE_M"],
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=kernel_top_k,
+        FP16_COMPUTE=a.dtype == torch.float16,
         compute_type=_compute_type(a.dtype),
         num_warps=cfg.get("num_warps", 4),
         num_stages=cfg.get("num_stages", 3),

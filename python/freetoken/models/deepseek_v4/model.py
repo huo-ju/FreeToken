@@ -26,9 +26,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from freetoken.core import get_global_ctx
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
 from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
 from freetoken.models.blocks import BaseLLMModel
+from freetoken.utils import div_ceil
 
 from .args import DeepseekV4Args
 from .attention import Attention
@@ -45,6 +47,38 @@ from .layers import (  # noqa: F401
     get_window_topk_idxs,
 )
 from .moe import Expert, Gate  # noqa: F401
+
+
+class VocabParallelEmbedding(nn.Module):
+    """nn.Module counterpart of FreeToken's vocab-parallel embedding.
+
+    DSV4 uses an nn.Module parameter tree, while the shared FreeToken embedding
+    primitive is a BaseOP. Keep the same padded row partition and collective
+    contract here so ``embed.weight`` remains a normal registered parameter.
+    """
+
+    def __init__(self, vocab_size: int, dim: int, dtype: torch.dtype):
+        super().__init__()
+        tp = get_tp_info()
+        self.tp_size = tp.size
+        self.vocab_size = vocab_size
+        self.rows = div_ceil(vocab_size, tp.size)
+        self.start = self.rows * tp.rank
+        self.finish = min(self.start + self.rows, vocab_size)
+        self.weight = nn.Parameter(
+            torch.empty(self.rows, dim, dtype=dtype), requires_grad=False
+        )
+        self._comm = DistributedCommunicator()
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.tp_size == 1:
+            return F.embedding(input_ids, self.weight)
+        local = input_ids - self.start
+        mask = (input_ids >= self.start) & (input_ids < self.finish)
+        local = local.masked_fill(~mask, 0)
+        output = F.embedding(local, self.weight)
+        output.masked_fill_(~mask.unsqueeze(-1), 0)
+        return self._comm.all_reduce(output)
 
 
 class Block(nn.Module):
@@ -134,11 +168,20 @@ class Transformer(nn.Module):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.hc_mult = hc_mult = args.hc_mult
-        self.embed = nn.Embedding(args.vocab_size, args.dim)
-        self.embed.weight.requires_grad_(False)
+        tp = get_tp_info()
+        self.tp_size = tp.size
+        self.vocab_size = args.vocab_size
+        self.vocab_rows = div_ceil(args.vocab_size, tp.size)
+        self.embed = VocabParallelEmbedding(
+            args.vocab_size, args.dim, args.compute_dtype
+        )
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)
-        self.head = nn.Parameter(torch.empty(args.vocab_size, args.dim, dtype=torch.bfloat16), requires_grad=False)
+        self.head = nn.Parameter(
+            torch.empty(self.vocab_rows, args.dim, dtype=args.compute_dtype),
+            requires_grad=False,
+        )
+        self._comm = DistributedCommunicator()
         hc_dim = hc_mult * args.dim
         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
@@ -157,6 +200,18 @@ class Transformer(nn.Module):
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         M = shape[0] * shape[1]
         return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
+
+    def lm_head(self, x: torch.Tensor) -> torch.Tensor:
+        logits = F.linear(x, self.head)
+        if self.tp_size == 1:
+            return logits
+        shape = logits.shape
+        gathered = self._comm.all_gather(logits)
+        if shape[0] == 1:
+            return gathered.view(1, -1)[:, : self.vocab_size]
+        gathered = gathered.view((self.tp_size,) + shape)
+        gathered = gathered.permute(1, 0, 2).contiguous()
+        return gathered.reshape(shape[0], self.tp_size * shape[1])[:, : self.vocab_size]
 
     def prefill_batched(
         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
@@ -178,7 +233,7 @@ class Transformer(nn.Module):
             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
         h = self.hc_head(h)
         h = self.norm(h)
-        return F.linear(h[0, last_indices], self.head)  # [B, vocab]
+        return self.lm_head(h[0, last_indices])  # [B, vocab]
 
     def decode(
         self, input_ids: torch.Tensor, pos: torch.Tensor, cmp_stage_cap: int
@@ -206,7 +261,7 @@ class Transformer(nn.Module):
             h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
         h = self.hc_head(h)
         h = self.norm(h)
-        return F.linear(h[:, -1], self.head)
+        return self.lm_head(h[:, -1])
 
 
 class DeepseekV4ForCausalLM(BaseLLMModel):

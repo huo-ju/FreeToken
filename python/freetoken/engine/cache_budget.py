@@ -14,7 +14,9 @@ if TYPE_CHECKING:
     import torch
 
 
-def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
+def expert_bytes_per_slot(
+    sources: dict[str, "list[torch.Tensor | None]"],
+) -> int:
     """Bytes one expert slot occupies on GPU: summed row bytes over all banks.
 
     Each bank source is per-layer ``[num_experts, *row_shape]`` tensors and is
@@ -25,7 +27,80 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
     # tensor[0].numel() is the per-row element count (one expert slot); see the matching
     # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    total = 0
+    for layers in sources.values():
+        source = next((tensor for tensor in layers if tensor is not None), None)
+        if source is None:
+            raise ValueError("cannot infer expert slot bytes from GPU-only sources")
+        total += source[0].numel() * source.element_size()
+    return total
+
+
+def expert_bytes_per_slot_from_specs(
+    specs: dict[str, tuple[tuple[int, ...], "torch.dtype"]]
+) -> int:
+    """Allocation-only counterpart of :func:`expert_bytes_per_slot`.
+
+    ``shape`` is one complete layer ``[num_experts, ...]``; divide its bytes by
+    the leading expert count to obtain one GPU slot. This is used before host
+    banks exist by the GPU-only streaming path.
+    """
+    import math
+
+    import torch
+
+    total = 0
+    for shape, dtype in specs.values():
+        if not shape or shape[0] <= 0:
+            raise ValueError(f"invalid expert bank shape {shape}")
+        total += math.prod(shape[1:]) * torch.empty((), dtype=dtype).element_size()
+    return total
+
+
+def plan_gpu_only_layers(
+    *,
+    cache_size: int,
+    num_experts: int,
+    num_layers: int,
+    prefill_overlap: bool,
+    requested: int,
+) -> tuple[int, ...]:
+    """Choose whole layers whose host backing can be replaced by GPU slots.
+
+    Unless every expert fits, the plan preserves one dynamic full-layer buffer,
+    or two when prefill overlap is enabled. ``requested=-1`` consumes every
+    additional complete layer; ``0`` disables the tier; a positive request is
+    strict and fails rather than silently retaining more host RAM than asked.
+
+    The deepest layers are selected. DSV4's leading hash-routed layers tend to
+    have stronger short-term locality and benefit more from the dynamic LRU,
+    while every layer saves the same number of host bytes.
+    """
+    if requested < -1:
+        raise ValueError("moe_gpu_only_layers must be -1 (auto) or >= 0")
+    if requested == 0:
+        return ()
+    total = num_layers * num_experts
+    all_fit = cache_size >= total
+    dynamic_floor = (2 if prefill_overlap else 1) * num_experts
+    maximum_partial = min(
+        max(0, num_layers - 1),
+        max(0, (cache_size - dynamic_floor) // num_experts),
+    )
+    if requested == -1:
+        count = num_layers if all_fit else maximum_partial
+    else:
+        count = requested
+    # Full residency is a special geometry: no host-backed layer remains, so
+    # the engine disables prefill overlap and needs no dynamic buffer. A
+    # *partial* plan must still preserve the ordinary one/two-layer floor.
+    full_residency = count == num_layers and all_fit
+    if not full_residency and count > maximum_partial:
+        raise ValueError(
+            f"moe_gpu_only_layers={count} exceeds the {maximum_partial} complete layers that fit "
+            f"in cache_size={cache_size} while preserving the dynamic cache floor"
+        )
+    return tuple(range(num_layers - count, num_layers))
 
 
 def net_cache_budget_bytes(

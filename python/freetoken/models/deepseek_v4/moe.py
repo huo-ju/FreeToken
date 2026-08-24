@@ -7,9 +7,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.layers import OffloadMoELayer
+from freetoken.utils import div_even
 
 from .args import DeepseekV4Args
 from .layers import Linear
@@ -24,7 +26,10 @@ class Gate(nn.Module):
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
-        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16), requires_grad=False)
+        self.weight = nn.Parameter(
+            torch.empty(args.n_routed_experts, args.dim, dtype=args.compute_dtype),
+            requires_grad=False,
+        )
         if self.hash:
             self.tid2eid = nn.Parameter(
                 torch.empty(args.vocab_size, args.n_activated_experts, dtype=torch.int64), requires_grad=False
@@ -60,9 +65,10 @@ class Expert(nn.Module):
 
     def __init__(self, dim: int, inter_dim: int, swiglu_limit: float):
         super().__init__()
-        self.w1 = Linear(dim, inter_dim, kind="fp8")
-        self.w2 = Linear(inter_dim, dim, kind="fp8")
-        self.w3 = Linear(dim, inter_dim, kind="fp8")
+        local_inter = div_even(inter_dim, get_tp_info().size)
+        self.w1 = Linear(dim, local_inter, kind="fp8")
+        self.w2 = Linear(local_inter, dim, kind="fp8")
+        self.w3 = Linear(dim, local_inter, kind="fp8")
         self.swiglu_limit = swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -88,12 +94,22 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         )
         self.swiglu_limit = args.swiglu_limit
 
+    def _maybe_all_reduce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The shared expert is partitioned over the same intermediate axis.
+        # MoE.forward combines both local partials and reduces once, avoiding a
+        # second collective per layer.
+        return hidden_states
+
     def _prefill_routed(
         self,
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        cache = self.offload_cache
+        assert cache is not None
+        if cache.is_gpu_resident_layer(self.layer_id):
+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
         # Whole-layer streaming moves all num_experts rows per layer; a small
         # chunk touches at most T*top_k of them, so below that crossover the
         # decode-style on-demand slot path strictly moves fewer bytes (and
@@ -102,8 +118,6 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # streaming buffers disown their borrowed slots on invalidation.
         if hidden_states.shape[0] * self.top_k >= self.num_experts:
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        cache = self.offload_cache
-        assert cache is not None
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
         cache.copy_missing()
         if cache.collect_stats:
@@ -126,6 +140,8 @@ class MoE(nn.Module):
     def __init__(self, layer_id: int, args: DeepseekV4Args):
         super().__init__()
         self.dim = args.dim
+        self.tp_size = get_tp_info().size
+        self._comm = DistributedCommunicator()
         self.gate = Gate(layer_id, args)
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
         self.experts = DSV4OffloadMoELayer(layer_id, args)
@@ -143,4 +159,7 @@ class MoE(nn.Module):
         routed = self.experts.routed_forward(
             x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
         )
-        return (routed + shared).view(shape)
+        output = routed + shared
+        if self.tp_size > 1:
+            output = self._comm.all_reduce(output)
+        return output.view(shape)

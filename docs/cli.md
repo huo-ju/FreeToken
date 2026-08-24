@@ -44,6 +44,7 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
+| `--tensor-parallel-size`, `--tp-size` | 1 | Number of local GPUs / tensor-parallel ranks |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
 
@@ -66,11 +67,17 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--moe-gpu-only-layers` | auto | DSV4 safetensors: keep as many complete expert layers as fit exclusively on GPU and release their host pages; `0` disables, `N` requires exactly N |
+| `--expert-load` | auto | Expert-bank reader: `serial` minimizes transient host RAM, `parallel` favors startup speed, auto chooses from available RAM |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+
+GPU-only layers use protected cache slots and cannot be recovered from host RAM.
+Changing the MoE cache size through `ft ctl cache --moe ...` therefore requires a
+server restart when this tier is active.
 
 ### API behaviour
 
@@ -153,4 +160,3 @@ expert format + GPU name, so a profile from different hardware is ignored
 rather than misapplied. Selection flags: `--dtype`, `--model`, `--formats`,
 `--isa`; decision rule: `--threshold` (default 2.0 — recommend hybrid when CPU
 bandwidth > 2× PCIe).
-

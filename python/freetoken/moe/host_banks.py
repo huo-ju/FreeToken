@@ -35,14 +35,16 @@ class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
     ``PINNED`` (cudaHostRegister'd) is required for anything the GPU dereferences:
-    the decode gather kernels and the DMA prefill copies. ``LOCKED`` (VirtualLock /
-    mlock: resident for the CPU executor, but with no device address) and
-    ``PAGEABLE`` are reserved for platforms where the pin quota cannot cover every
-    layer (Windows/WDDM); their movement paths are not implemented here -- layers
-    with either class must be served by the CPU executor.
+    the decode gather kernels and the DMA prefill copies. ``GPU_ONLY`` means the
+    layer was copied into protected GPU-cache slots while loading and its anonymous
+    host pages were discarded afterwards. ``LOCKED`` (VirtualLock / mlock:
+    resident for the CPU executor, but with no device address) and ``PAGEABLE`` are
+    reserved for platforms where the pin quota cannot cover every layer; their
+    movement paths are not implemented here.
     """
 
     PINNED = "pinned"
+    GPU_ONLY = "gpu_only"
     LOCKED = "locked"
     PAGEABLE = "pageable"
 
@@ -66,7 +68,17 @@ class HostBank:
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+        # ``mmap(-1, size)`` defaults to MAP_SHARED on Unix. Shared anonymous
+        # pages live in shmem and MADV_DONTNEED does not reliably reclaim them,
+        # which defeats GPU-only residency: staged layers keep consuming host
+        # RAM. No bank is shared across processes, so use a private anonymous
+        # mapping whose dirty pages are discarded immediately by MADV_DONTNEED.
+        self._buf = mmap.mmap(
+            -1,
+            asize,
+            flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )  # lazy: address space only, no resident pages yet
         _LIVE_BUFFERS.append(self._buf)
         self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
@@ -192,6 +204,50 @@ class PinPipeline:
         self.wait()
 
 
+class ServingLayerPipeline:
+    """Mixed serving sink for pinned and GPU-only expert layers.
+
+    Loaders call this once all banks of a layer have been filled. Pinned layers
+    enter the ordinary asynchronous :class:`PinPipeline`. GPU-only layers are
+    handed to ``gpu_sink`` as ``{name: tensor}``; once that callback returns, the
+    now-redundant anonymous host pages are discarded with ``MADV_DONTNEED``.
+
+    ``gpu_sink`` must not retain or asynchronously read the host tensors after it
+    returns. The offload cache's sink performs a blocking H2D copy for precisely
+    this reason.
+    """
+
+    def __init__(self, residency: list[str], gpu_sink) -> None:
+        self._residency = list(residency)
+        self._gpu_sink = gpu_sink
+        self._pins: PinPipeline | None = None
+
+    def __enter__(self) -> "ServingLayerPipeline":
+        self._pins = PinPipeline()
+        return self
+
+    def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
+        assert self._pins is not None, "ServingLayerPipeline used outside its context"
+        residence = HostResidency(self._residency[layer_id])
+        if residence is HostResidency.PINNED:
+            self._pins(layer_id, banks)
+            return
+        if residence is not HostResidency.GPU_ONLY:
+            raise NotImplementedError(
+                f"serving expert layer {layer_id} with residency {residence.value!r} "
+                "is not implemented"
+            )
+        if self._gpu_sink is None:
+            raise RuntimeError(f"GPU-only expert layer {layer_id} has no GPU sink")
+        self._gpu_sink(layer_id, {name: bank.tensor for name, bank in banks.items()})
+        for bank in banks.values():
+            bank.release()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        assert self._pins is not None
+        self._pins.__exit__(exc_type, exc, tb)
+
+
 class LayerCompletionTracker:
     """Fire a sink once per layer, when all of that layer's writes have landed.
 
@@ -259,6 +315,7 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
 __all__ = [
     "HostBank",
     "HostResidency",
+    "ServingLayerPipeline",
     "LayerCompletionTracker",
     "PinPipeline",
     "alloc_banks",

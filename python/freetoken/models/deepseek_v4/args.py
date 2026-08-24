@@ -13,6 +13,8 @@ import os
 from dataclasses import dataclass, field, fields
 from typing import Literal, Tuple
 
+import torch
+
 
 @dataclass
 class DeepseekV4Args:
@@ -23,6 +25,9 @@ class DeepseekV4Args:
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
     expert_dtype: Literal[None, "fp4"] = "fp4"
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
+    # Engine-resolved activation/plain-weight dtype. BF16 on Ampere+, FP16 on
+    # SM75; quantized FP8/FP4 storage remains unchanged.
+    compute_dtype: torch.dtype = torch.bfloat16
 
     # ----- shape -----
     vocab_size: int = 129280
@@ -102,7 +107,9 @@ def load_args(model_path: str, **overrides) -> DeepseekV4Args:
     """
     with open(_config_path(model_path)) as f:
         raw = json.load(f)
-    valid = {f.name for f in fields(DeepseekV4Args)}
+    # ``compute_dtype`` is an engine-only torch.dtype, never checkpoint JSON.
+    # Keep a stray string field from being accepted as if it were a real dtype.
+    valid = {f.name for f in fields(DeepseekV4Args) if f.name != "compute_dtype"}
     kwargs = {k: v for k, v in raw.items() if k in valid}
     kwargs.update(overrides)
     return DeepseekV4Args(**kwargs)

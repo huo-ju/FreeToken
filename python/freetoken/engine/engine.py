@@ -473,13 +473,35 @@ class Engine:
             device=self.device,
         )
 
-    def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
+    def _resolve_auto_moe_cache_size(
+        self,
+        config: EngineConfig,
+        banks=None,
+        *,
+        bank_specs=None,
+        quant_format: str | None = None,
+    ) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
         Pure glue over the Phase-1 budget policy; isolated here so it is unit-testable
         without a GPU. Reused by the Phase-2 runtime rebuild.
         """
-        from freetoken.engine.cache_budget import expert_bytes_per_slot, resolve_moe_cache_auto
+        from freetoken.engine.cache_budget import (
+            expert_bytes_per_slot,
+            expert_bytes_per_slot_from_specs,
+            resolve_moe_cache_auto,
+        )
+
+        if (banks is None) == (bank_specs is None):
+            raise ValueError("pass exactly one of banks or bank_specs")
+        if banks is not None:
+            per_expert_bytes = expert_bytes_per_slot(banks.sources)
+            resolved_format = banks.quant_format
+        else:
+            per_expert_bytes = expert_bytes_per_slot_from_specs(bank_specs)
+            if quant_format is None:
+                raise ValueError("quant_format is required with bank_specs")
+            resolved_format = quant_format
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
@@ -491,13 +513,13 @@ class Engine:
             memory_ratio=config.memory_ratio,
             cache_per_page=cache_per_page,
             fixed_cache_size=fixed_cache_size,
-            per_expert_bytes=expert_bytes_per_slot(banks.sources),
+            per_expert_bytes=per_expert_bytes,
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
-            quant_format=banks.quant_format,
+            quant_format=resolved_format,
         )
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
@@ -526,23 +548,25 @@ class Engine:
         else:
             decode_target = "gpu"
         if cache_factory is None:
+            from freetoken.engine.cache_budget import plan_gpu_only_layers
+            from freetoken.moe.expert_banks import expert_bank_specs
+
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
             # expert-tensor granularity. Both pin-after-fill.
             # --expert-load: serial/parallel force the read; auto (None) lets load_expert_banks
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
-            banks = load_expert_banks(
-                config.model_path,
-                config.model_config,
-                device=self.device,
-                dtype=self.dtype,
-                dummy=config.use_dummy_weight,
-                parallel=expert_parallel,
-                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
-            )
-            if config.moe_cache_auto:
-                size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
+            specs = expert_bank_specs(config.model_config)
+            pre_resolved_auto = config.moe_cache_auto and specs is not None
+            expected_format = getattr(config.model_config, "expert_quant", None)
+            if pre_resolved_auto:
+                # DSV4 exposes exact per-rank bank geometry, so solve the slot/KV
+                # split before host experts exist. That in turn lets selected
+                # layers stream directly into their final GPU ranges.
+                size, pages, overlap = self._resolve_auto_moe_cache_size(
+                    config, bank_specs=specs, quant_format=expected_format
+                )
                 object.__setattr__(config, "moe_cache_size", size)
                 object.__setattr__(config, "moe_prefill_overlap", overlap)
                 if config.num_page_override is None:
@@ -558,21 +582,150 @@ class Engine:
                     f"--moe-cache-auto resolved moe_cache_size={size} "
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
-            _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
-            cache = OffloadMoeCache(
-                # Models with leading dense layers (GLM-4) only have experts on the MoE
-                # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-                num_layers=config.model_config.num_moe_layers,
-                num_experts=config.model_config.num_experts,
-                cache_size=config.moe_cache_size,
+            if specs is not None or not config.moe_cache_auto:
+                _require_offload_cache_size(
+                    config.moe_cache_size, config.model_config.num_experts
+                )
+
+            requested_gpu_only = getattr(config, "moe_gpu_only_layers", -1)
+            gpu_only_ids: tuple[int, ...] = ()
+            if requested_gpu_only != 0:
+                if decode_target != "gpu":
+                    if requested_gpu_only > 0:
+                        raise ValueError(
+                            "--moe-gpu-only-layers requires pure --moe-backend offload; "
+                            "CPU/hybrid decode needs host backing for every layer"
+                        )
+                elif specs is None:
+                    if requested_gpu_only > 0:
+                        raise ValueError(
+                            "--moe-gpu-only-layers is not implemented for this expert format"
+                        )
+                else:
+                    from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+                    if (
+                        config.model_path
+                        and is_ftw_checkpoint(config.model_path)
+                        and not config.use_dummy_weight
+                    ):
+                        if requested_gpu_only > 0:
+                            raise ValueError(
+                                "--moe-gpu-only-layers currently requires the original "
+                                "DeepSeek-V4 safetensors checkpoint, not FTW"
+                            )
+                        logger.warning_rank0(
+                            "GPU-only expert layers are unavailable for FTW input; retaining "
+                            "host backing for every layer"
+                        )
+                    else:
+                        gpu_only_ids = plan_gpu_only_layers(
+                            cache_size=config.moe_cache_size,
+                            num_experts=config.model_config.num_experts,
+                            num_layers=config.model_config.num_moe_layers,
+                            prefill_overlap=config.moe_prefill_overlap,
+                            requested=requested_gpu_only,
+                        )
+            if (
+                len(gpu_only_ids) == config.model_config.num_moe_layers
+                and config.moe_prefill_overlap
+            ):
+                # No host-backed layer remains, so double buffers only alias and
+                # overwrite permanent weights. The resident grouped-GEMM path
+                # needs no copy overlap at all.
+                object.__setattr__(config, "moe_prefill_overlap", False)
+
+            cache = None
+            if specs is not None:
+                cache = OffloadMoeCache(
+                    # Models with leading dense layers (GLM-4) only have experts on the MoE
+                    # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
+                    num_layers=config.model_config.num_moe_layers,
+                    num_experts=config.model_config.num_experts,
+                    cache_size=config.moe_cache_size,
+                    device=self.device,
+                    cache_policy=config.moe_cache_policy,
+                    prefill_overlap=config.moe_prefill_overlap,
+                    prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                    quant_format=expected_format,
+                    decode_target=decode_target,
+                    hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                )
+            if gpu_only_ids:
+                from freetoken.engine.cache_budget import expert_bytes_per_slot_from_specs
+                from freetoken.moe.host_banks import HostResidency
+
+                assert cache is not None
+                cache.prepare_gpu_resident_layers(specs, gpu_only_ids)
+                residency = [HostResidency.PINNED.value] * config.model_config.num_moe_layers
+                for layer_id in gpu_only_ids:
+                    residency[layer_id] = HostResidency.GPU_ONLY.value
+                per_slot = expert_bytes_per_slot_from_specs(specs)
+                per_rank = (
+                    len(gpu_only_ids) * config.model_config.num_experts
+                    * per_slot
+                )
+                aggregate = per_rank * config.tp_info.size
+                retained = (
+                    (config.model_config.num_moe_layers - len(gpu_only_ids))
+                    * config.model_config.num_experts
+                    * per_slot
+                    * config.tp_info.size
+                )
+                logger.info_rank0(
+                    f"GPU-only MoE tier: {len(gpu_only_ids)} layers "
+                    f"({gpu_only_ids[0]}..{gpu_only_ids[-1]}), releasing "
+                    f"{mem_GB(per_rank)} host RAM per TP rank / "
+                    f"{mem_GB(aggregate)} aggregate after staging; retained expert "
+                    f"host backing is about {mem_GB(retained)} aggregate"
+                )
+            else:
+                residency = None
+
+            banks = load_expert_banks(
+                config.model_path,
+                config.model_config,
                 device=self.device,
-                cache_policy=config.moe_cache_policy,
-                prefill_overlap=config.moe_prefill_overlap,
-                prefill_hit_d2d=config.moe_prefill_hit_d2d,
-                quant_format=banks.quant_format,
-                decode_target=decode_target,
-                hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                dtype=self.dtype,
+                dummy=config.use_dummy_weight,
+                parallel=expert_parallel,
+                decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                layer_residency=residency,
+                gpu_sink=(cache.stage_gpu_resident_layer if gpu_only_ids else None),
             )
+            if not pre_resolved_auto and config.moe_cache_auto:
+                size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
+                object.__setattr__(config, "moe_cache_size", size)
+                object.__setattr__(config, "moe_prefill_overlap", overlap)
+                if config.num_page_override is None:
+                    object.__setattr__(config, "num_page_override", pages)
+                logger.info_rank0(
+                    f"--moe-cache-auto resolved moe_cache_size={size} "
+                    f"num_pages={pages} (prefill_overlap={overlap})"
+                )
+            _require_offload_cache_size(
+                config.moe_cache_size, config.model_config.num_experts
+            )
+            if cache is None:
+                # Formats without allocation-only specs retain the existing
+                # load-first path and construct the cache from the actual banks.
+                cache = OffloadMoeCache(
+                    num_layers=config.model_config.num_moe_layers,
+                    num_experts=config.model_config.num_experts,
+                    cache_size=config.moe_cache_size,
+                    device=self.device,
+                    cache_policy=config.moe_cache_policy,
+                    prefill_overlap=config.moe_prefill_overlap,
+                    prefill_hit_d2d=config.moe_prefill_hit_d2d,
+                    quant_format=banks.quant_format,
+                    decode_target=decode_target,
+                    hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                )
+            elif banks.quant_format != expected_format:
+                raise RuntimeError(
+                    f"expert provider returned {banks.quant_format!r}, expected "
+                    f"allocation format {expected_format!r}"
+                )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
@@ -681,15 +834,13 @@ class Engine:
         return min_free_memory, max_free_memory
 
     def _target_moe_and_expert_bytes(self, moe_cache_size: int | None) -> tuple[int, int]:
-        from freetoken.engine.cache_budget import expert_bytes_per_slot
-
         target_moe = (
             moe_cache_size
             if moe_cache_size is not None
             else (self.moe_offload_cache.cache_size if self.moe_offload_cache else 0)
         )
         per_expert_bytes = (
-            expert_bytes_per_slot(self.moe_offload_cache.bank_sources)
+            self.moe_offload_cache.expert_bytes_per_slot
             if self.moe_offload_cache is not None else 0
         )
         return target_moe, per_expert_bytes
@@ -996,6 +1147,9 @@ def _adjust_dsv4_config(config: EngineConfig, override) -> None:
     model_config = config.model_config
     model_config.dsv4_args.max_seq_len = config.max_seq_len
     model_config.dsv4_args.max_batch_size = config.max_running_req + 1  # +1 dummy
+    model_config.dsv4_args.compute_dtype = getattr(
+        config, "dtype", getattr(model_config.dsv4_args, "compute_dtype", torch.bfloat16)
+    )
     # config.swa_full_tokens_ratio is the DSV4 window/full ratio directly (default sizing);
     # a runtime rebuild pins an absolute window via swa_num_pages_override instead.
     # DSV4's KV page IS the P-token window page (window == radix reuse granularity == lcm of
@@ -1084,6 +1238,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
+    "moe_gpu_only_layers": -1,
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
@@ -1169,6 +1324,19 @@ def _adjust_config(config: EngineConfig):
 
     if is_dsv4:
         _adjust_dsv4_config(config, override)
+        if (
+            getattr(getattr(config, "tp_info", None), "size", 1) > 1
+            and getattr(config, "model_path", None)
+            and not getattr(config, "use_dummy_weight", False)
+        ):
+            from freetoken.checkpoint.ftw import is_ftw_checkpoint
+
+            if is_ftw_checkpoint(config.model_path):
+                raise ValueError(
+                    "DeepSeek-V4 tensor parallelism currently requires the original "
+                    "safetensors checkpoint. FTW expert banks were written in a TP=1 "
+                    "layout and cannot be safely sharded at serve time."
+                )
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).

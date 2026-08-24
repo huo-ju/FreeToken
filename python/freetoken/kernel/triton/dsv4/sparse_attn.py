@@ -39,13 +39,34 @@ import torch
 import triton
 import triton.language as tl
 
+from freetoken.utils import is_sm75_device
+
+
+# Default launch geometry. The gather has exactly ONE tl.load site (the pool base is selected
+# per column), so it stages a single [BLOCK_T, D] KV tile. At D=512 this configuration needs
+# about 99 KiB of shared memory and fits consumer Blackwell, but not Turing's 64 KiB opt-in
+# limit. ``_launch_config`` selects a smaller candidate tile and one pipeline stage on SM75.
 BLOCK_H = 16
-# The gather has exactly ONE tl.load site (the pool base is selected per column), so it stages
-# a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB
-# consumer-Blackwell (sm_120, e.g. RTX 5090) budget. (BLOCK_T=64 would need ~103KB.)
 BLOCK_T = 32
+NUM_WARPS = 8
+NUM_STAGES = 2
+SM75_BLOCK_T = 8
+SM75_NUM_STAGES = 1
 MAX_SPLITS = 32
-MIN_TILES_PER_SPLIT = 4
+MIN_CANDIDATES_PER_SPLIT = 128
+
+
+def _launch_config(device) -> tuple[int, int, int, int]:
+    """Return ``(BLOCK_H, BLOCK_T, num_warps, num_stages)`` for ``device``.
+
+    DSV4's real latent width is 512. With the default 32-column, two-stage tile Triton asks
+    for 100416 bytes of shared memory, while an SM75 TITAN RTX can opt in to only 65536 bytes.
+    An 8-column staged candidate tile and one stage keep the same head geometry and a native
+    Tensor Core N=8 dot shape while bringing the launch below that hardware limit.
+    """
+    if is_sm75_device(device):
+        return BLOCK_H, SM75_BLOCK_T, NUM_WARPS, SM75_NUM_STAGES
+    return BLOCK_H, BLOCK_T, NUM_WARPS, NUM_STAGES
 
 
 @triton.jit
@@ -261,23 +282,31 @@ def _sparse_attn_splitk_merge_kernel(
     tl.store(o_ptrs, o.to(o_ptr.dtype.element_ty))
 
 
-def split_count(b: int, m: int, h: int, topk: int, device) -> int:
+def _split_count(
+    b: int, m: int, h: int, topk: int, device, block_h: int
+) -> int:
     """How many ways to split the candidate axis; 0 means run the single-program kernel.
 
     Prefill (m > 1) never splits. Decode splits until either every SM has a program or the
-    slices drop below MIN_TILES_PER_SPLIT tiles of real work -- every split, including the ones
-    a small live count leaves empty, still stores a [D] partial the merge reads back, so
-    over-splitting buys occupancy in stage 1 and pays for it twice in stage 2.
+    slices drop below ``MIN_CANDIDATES_PER_SPLIT`` columns of real work -- every split,
+    including the ones a small live count leaves empty, still stores a [D] partial the merge
+    reads back, so over-splitting buys occupancy in stage 1 and pays for it twice in stage 2.
     """
     if m != 1:
         return 0
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     n_splits = min(
         MAX_SPLITS,
-        triton.cdiv(topk, MIN_TILES_PER_SPLIT * BLOCK_T),
-        max(1, sm_count // (b * triton.cdiv(h, BLOCK_H))),
+        triton.cdiv(topk, MIN_CANDIDATES_PER_SPLIT),
+        max(1, sm_count // (b * triton.cdiv(h, block_h))),
     )
     return n_splits if n_splits > 1 else 0
+
+
+def split_count(b: int, m: int, h: int, topk: int, device) -> int:
+    """Public shape-only split policy using the launch geometry for ``device``."""
+    block_h, _, _, _ = _launch_config(device)
+    return _split_count(b, m, h, topk, device, block_h)
 
 
 def sparse_attn_paged(
@@ -322,15 +351,16 @@ def sparse_attn_paged(
     else:
         cnt, stride_nb, stride_nm = idx, 0, 0
 
-    n_splits = split_count(b, m, h, topk, q.device)
+    block_h, block_t, num_warps, num_stages = _launch_config(q.device)
+    n_splits = _split_count(b, m, h, topk, q.device, block_h)
     if n_splits:
         return _sparse_attn_paged_splitk(
             q, window_pool, cmp_pool, sink, idx, cnt, o,
             b, m, h, d, topk, n_window, softmax_scale, has_counts, stride_nb, stride_nm,
-            n_splits,
+            n_splits, block_h, block_t, num_warps, num_stages,
         )
 
-    grid = (m, b, triton.cdiv(h, BLOCK_H))
+    grid = (m, b, triton.cdiv(h, block_h))
     _sparse_attn_paged_kernel[grid](
         q, window_pool, cmp_pool, o, sink, idx, cnt,
         float(softmax_scale),
@@ -342,11 +372,11 @@ def sparse_attn_paged(
         idx.stride(0), idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D=d,
-        BLOCK_H=BLOCK_H,
-        BLOCK_T=BLOCK_T,
+        BLOCK_H=block_h,
+        BLOCK_T=block_t,
         HAS_COUNTS=has_counts,
-        num_warps=8,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return o
 
@@ -354,8 +384,9 @@ def sparse_attn_paged(
 def _sparse_attn_paged_splitk(
     q, window_pool, cmp_pool, sink, idx, cnt, o,
     b, m, h, d, topk, n_window, softmax_scale, has_counts, stride_nb, stride_nm, n_splits,
+    block_h, block_t, num_warps, num_stages,
 ):
-    head_blocks = triton.cdiv(h, BLOCK_H)
+    head_blocks = triton.cdiv(h, block_h)
     mid_o = torch.empty((b, m, h, n_splits, d), dtype=torch.float32, device=q.device)
     mid_lse = torch.empty((b, m, h, n_splits), dtype=torch.float32, device=q.device)
 
@@ -371,12 +402,12 @@ def _sparse_attn_paged_splitk(
         idx.stride(0), idx.stride(1), idx.stride(2),
         stride_nb, stride_nm,
         D=d,
-        BLOCK_H=BLOCK_H,
-        BLOCK_T=BLOCK_T,
+        BLOCK_H=block_h,
+        BLOCK_T=block_t,
         HAS_COUNTS=has_counts,
         NUM_SPLITS=n_splits,
-        num_warps=8,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     _sparse_attn_splitk_merge_kernel[(m, b, h)](
         mid_o, mid_lse, o, sink,

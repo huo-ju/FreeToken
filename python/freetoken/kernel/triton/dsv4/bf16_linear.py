@@ -1,14 +1,14 @@
-"""bf16-weight GEMV with on-chip upcast + fp32 accumulate/output (DeepSeek-V4).
+"""Native-16 weight GEMV with on-chip upcast + FP32 output (DeepSeek-V4).
 
-Several DSV4 decode ops need fp32 *math* on bf16 weights (the compressor wkv/wgate
+Several DSV4 decode ops need FP32 *math* on 16-bit weights (the compressor wkv/wgate
 gated pool, the MoE router) for numerical stability. Doing it as
-``F.linear(x.float(), w.float())`` materializes an fp32 copy of the weight in HBM
-every step (read bf16 + write fp32 + re-read fp32) and runs a heavier fp32 GEMM.
+``F.linear(x.float(), w.float())`` materializes an FP32 copy of the weight in HBM
+every step (read 16-bit + write FP32 + re-read FP32) and runs a heavier FP32 GEMM.
 
-This kernel instead streams the bf16 weight from HBM once, upcasts to fp32 in
-registers (on-chip), and accumulates in fp32 -> fp32 output. Same precision as the
-reference (only the fp32 accumulation *order* differs, ~1e-6), at the HBM cost of a
-plain bf16 read. Decode is M==1 (a GEMV); M>1 (prefill) falls back to F.linear.
+This kernel instead streams BF16 (Ampere+) or FP16 (SM75) from HBM once, upcasts
+to FP32 in registers, and accumulates to FP32. Same precision as the reference
+(only the FP32 accumulation *order* differs, ~1e-6), at the HBM cost of a plain
+16-bit read. Decode is M==1 (a GEMV); M>1 (prefill) falls back to F.linear.
 """
 
 from __future__ import annotations
@@ -41,9 +41,10 @@ def _bf16_gemv_fp32_kernel(
 
 
 def bf16_linear_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``out = x @ weight.T`` in fp32, reading ``weight`` (bf16) straight from HBM.
+    """``out = x @ weight.T`` in FP32, reading a 16-bit weight from HBM.
 
-    ``x``: ``[..., K]`` (leading dims collapse to M). ``weight``: ``[N, K]`` bf16.
+    ``x``: ``[..., K]`` (leading dims collapse to M). ``weight``: ``[N, K]``
+    BF16 or FP16.
     Returns ``[..., N]`` fp32. Bit-exact to ``F.linear(x.float(), weight.float())``
     up to fp32 accumulation order; for M>1 it *is* that call (prefill)."""
     *lead, K = x.shape

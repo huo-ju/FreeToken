@@ -64,6 +64,19 @@ def test_pool_tiers_present_per_ratio():
                 assert pool.idx_pool[L] is None
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_pool_uses_model_native_16bit_storage(dtype):
+    args = _args()
+    sizes = dsv4_pool_sizes(num_pages=8, args=args, swa_ratio=0.5, P=P)
+    pool = DSV4PagedKVCache(
+        sizes=sizes, args=args, device=DEVICE, dtype=dtype, P=P
+    )
+
+    assert all(t.dtype == dtype for t in pool.window_pool)
+    assert all(t is None or t.dtype == dtype for t in pool.cmp_pool)
+    assert all(t is None or t.dtype == dtype for t in pool.idx_pool)
+
+
 def test_state_ring_layout_and_dtype():
     pool, sizes, _ = _pool()
     for L, ratio in enumerate(RATIOS):

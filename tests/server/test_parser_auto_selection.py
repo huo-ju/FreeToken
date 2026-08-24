@@ -94,3 +94,19 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_gpu_only_layer_count_parser_accepts_auto_or_nonnegative_integer():
+    config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        automatic, _ = parse_args(
+            ["--model", ANON_PATH, "--moe-gpu-only-layers", "auto"]
+        )
+        fixed, _ = parse_args(
+            ["--model", ANON_PATH, "--moe-gpu-only-layers", "7"]
+        )
+        with pytest.raises(SystemExit):
+            parse_args(["--model", ANON_PATH, "--moe-gpu-only-layers", "-2"])
+
+    assert automatic.moe_gpu_only_layers == -1
+    assert fixed.moe_gpu_only_layers == 7
