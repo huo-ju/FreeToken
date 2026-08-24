@@ -129,6 +129,17 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be 'auto' or >= 0")
         return n
 
+    def _auto_or_nonnegative_float(value: str) -> float | None:
+        if value.strip().lower() == "auto":
+            return None
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be 'auto' or a non-negative number") from exc
+        if number < 0:
+            raise argparse.ArgumentTypeError("must be 'auto' or >= 0")
+        return number
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -512,7 +523,7 @@ def parse_args(
         "--moe-cache-size",
         type=int,
         default=ServerArgs.moe_cache_size,
-        help="The number of unified MoE expert slots on GPU.",
+        help="The number of rebuildable dynamic MoE expert slots on GPU.",
     )
     moe_cache_group.add_argument(
         "--moe-cache-rate",
@@ -545,14 +556,44 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-placement",
+        choices=["auto", "elastic", "manual"],
+        default=ServerArgs.moe_placement,
+        help=(
+            "Authoritative expert placement mode. auto/elastic solve host, pin, permanent "
+            "GPU, dynamic-cache and KV budgets before loading; manual treats layer flags "
+            "as exact constraints."
+        ),
+    )
+    parser.add_argument(
+        "--moe-host-budget-gb",
+        type=_auto_or_nonnegative_float,
+        default=ServerArgs.moe_host_budget_gb,
+        metavar="auto|N",
+        help="Aggregate host RAM budget for authoritative expert banks on this node.",
+    )
+    parser.add_argument(
+        "--moe-pin-budget-gb",
+        type=_auto_or_nonnegative_float,
+        default=ServerArgs.moe_pin_budget_gb,
+        metavar="auto|N",
+        help="Aggregate CUDA host-registration budget; overrides platform detection.",
+    )
+    parser.add_argument(
+        "--moe-placement-policy",
+        choices=["balanced", "gpu-first", "cpu-first"],
+        default=ServerArgs.moe_placement_policy,
+        help="How a pin deficit trades spare VRAM against locked CPU layers.",
+    )
+
+    parser.add_argument(
         "--moe-gpu-only-layers",
         type=_gpu_only_layers,
         default=ServerArgs.moe_gpu_only_layers,
         metavar="auto|N",
         help=(
-            "Keep complete expert layers exclusively in protected GPU slots and discard "
-            "their host backing while loading. 'auto' (default) uses every complete layer "
-            "that fits after the dynamic-cache/prefill floor; 0 disables it. Currently "
+            "Keep complete expert layers in an immutable GPU store and discard their host "
+            "backing while loading. 'auto' uses the placement budget; 0 disables it. Currently "
             "available for DeepSeek-V4 FP4 with the original safetensors checkpoint."
         ),
     )

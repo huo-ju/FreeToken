@@ -110,3 +110,28 @@ def test_gpu_only_layer_count_parser_accepts_auto_or_nonnegative_integer():
 
     assert automatic.moe_gpu_only_layers == -1
     assert fixed.moe_gpu_only_layers == 7
+
+
+def test_moe_placement_budget_flags_parse_auto_and_explicit_values():
+    config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        automatic, _ = parse_args(
+            ["--model", ANON_PATH, "--moe-host-budget-gb", "auto"]
+        )
+        explicit, _ = parse_args(
+            [
+                "--model", ANON_PATH,
+                "--moe-placement", "manual",
+                "--moe-host-budget-gb", "96",
+                "--moe-pin-budget-gb", "40.5",
+                "--moe-placement-policy", "gpu-first",
+            ]
+        )
+        with pytest.raises(SystemExit):
+            parse_args(["--model", ANON_PATH, "--moe-pin-budget-gb", "-1"])
+
+    assert automatic.moe_host_budget_gb is None
+    assert explicit.moe_placement == "manual"
+    assert explicit.moe_host_budget_gb == 96.0
+    assert explicit.moe_pin_budget_gb == 40.5
+    assert explicit.moe_placement_policy == "gpu-first"

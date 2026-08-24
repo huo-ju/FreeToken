@@ -33,9 +33,15 @@ class EngineConfig:
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
-    # Whole expert layers kept exclusively in protected GPU cache slots. Their
-    # host pages are discarded during loading. -1 = use as many complete layers
-    # as fit while retaining the dynamic-cache/prefill floor; 0 = disabled;
+    # Startup authoritative-placement policy.  The elastic runtime manager only
+    # resizes dynamic/KV pools after this one-shot plan settles.
+    moe_placement: str = "auto"
+    moe_host_budget_gb: float | None = None
+    moe_pin_budget_gb: float | None = None
+    moe_placement_policy: str = "balanced"
+    # Whole expert layers kept in a separate immutable GPU allocation. Their
+    # host pages are discarded during loading. -1 = let placement use only the
+    # minimum required by host/pin budgets; 0 = disabled;
     # positive = require exactly that many. Currently implemented for DSV4 ds_fp4.
     moe_gpu_only_layers: int = -1
     moe_prefill_overlap: bool = True

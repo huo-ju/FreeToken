@@ -81,8 +81,12 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
-| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
+| `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | Rebuildable dynamic GPU expert-cache size as slots / fraction / sized from free VRAM (mutually exclusive) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--moe-placement` | auto | Startup authoritative placement: `auto`, `elastic`, or exact-constraint `manual` |
+| `--moe-host-budget-gb` | auto | Aggregate node budget for retained host expert banks |
+| `--moe-pin-budget-gb` | auto | Aggregate node CUDA host-registration budget |
+| `--moe-placement-policy` | balanced | Pin-deficit policy: preserve elastic VRAM (`balanced`/`cpu-first`) or prefer permanent GPU layers (`gpu-first`) |
 | `--moe-gpu-only-layers` | auto | DSV4 safetensors: keep as many complete expert layers as fit exclusively on GPU and release their host pages; `0` disables, `N` requires exactly N |
 | `--expert-load` | auto | Expert-bank reader: `serial` minimizes transient host RAM, `parallel` favors startup speed, auto chooses from available RAM |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
@@ -91,9 +95,9 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
-GPU-only layers use protected cache slots and cannot be recovered from host RAM.
-Changing the MoE cache size through `ft ctl cache --moe ...` therefore requires a
-server restart when this tier is active.
+GPU-only layers use a physically separate immutable allocation and cannot be
+recovered from host RAM. The dynamic MoE cache can still be rebuilt through
+`ft ctl cache --moe ...`; permanent bytes remain a fixed floor.
 
 ### API behaviour
 

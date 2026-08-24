@@ -517,6 +517,138 @@ class Engine:
             quant_format=resolved_format,
         )
 
+    def _resolve_startup_moe_placement(
+        self,
+        config: EngineConfig,
+        specs,
+        explicit_cpu_layer_ids: frozenset[int],
+    ):
+        """Build the DSV4 allocation proof before any expert banks exist."""
+        from freetoken.checkpoint.ftw import is_ftw_checkpoint
+        from freetoken.engine.cache_budget import expert_bytes_per_slot_from_specs
+        from freetoken.engine.moe_placement import (
+            ExpertPlacementCapabilities,
+            MoePlacementInputs,
+            plan_moe_placement,
+        )
+
+        per_slot = expert_bytes_per_slot_from_specs(specs)
+        layers = config.model_config.num_moe_layers
+        experts = config.model_config.num_experts
+        per_layer = experts * per_slot
+        host_total = layers * per_layer
+
+        tp_size = max(1, config.tp_info.size)
+        if config.moe_host_budget_gb is not None:
+            host_budget = int(config.moe_host_budget_gb * 2**30) // tp_size
+        else:
+            available = None
+            try:
+                with open("/proc/meminfo", encoding="utf-8") as meminfo:
+                    for line in meminfo:
+                        if line.startswith("MemAvailable:"):
+                            available = int(line.split()[1]) * 1024
+                            break
+            except OSError:
+                pass
+            if available is None:
+                host_budget = host_total
+            else:
+                # Keep room for allocator/loader transients and the rest of the
+                # process.  This is deliberately conservative and observable.
+                safety = max(4 * 2**30, available // 10)
+                host_budget = max(0, available - safety) // tp_size
+
+        explicit_pin = config.moe_pin_budget_gb
+        detected_pin = _pin_budget_bytes()
+        pin_budget = (
+            int(explicit_pin * 2**30)
+            if explicit_pin is not None
+            else (detected_pin if detected_pin is not None else host_total)
+        )
+        if explicit_pin is not None or detected_pin is not None:
+            pin_budget //= tp_size
+
+        cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+        fixed_cache_size += state_pool_bytes(config)
+        reserve_tokens = max(config.kv_reserve_tokens, min_reserve)
+        reserve_pages = (
+            config.num_page_override
+            if config.num_page_override is not None
+            else math.ceil(reserve_tokens / page_tokens)
+        )
+        reserve_bytes = reserve_pages * cache_per_page
+        requested_dynamic = None if config.moe_cache_auto else config.moe_cache_size
+
+        ftw = bool(
+            config.model_path
+            and not config.use_dummy_weight
+            and is_ftw_checkpoint(config.model_path)
+        )
+        cpu_viable = _cpu_moe_executor_viable(config.model_config)
+        caps = ExpertPlacementCapabilities(
+            allocation_specs=True,
+            gpu_permanent_streaming=not ftw,
+            per_layer_host_residency=True,
+            cpu_executor_layout=cpu_viable,
+            mixed_cpu_gpu_layout=cpu_viable,
+            ftw_gpu_permanent_streaming=False,
+        )
+        requested_permanent = config.moe_gpu_only_layers
+        manual = config.moe_placement == "manual"
+        plan = plan_moe_placement(
+            MoePlacementInputs(
+                available_vram_bytes=self._baseline_free,
+                fixed_gpu_bytes=self._weights_bytes + fixed_cache_size,
+                activation_graph_reserve_bytes=int(
+                    (1.0 - config.memory_ratio) * self._baseline_free
+                ),
+                host_expert_budget_bytes=min(host_total, host_budget),
+                pin_budget_bytes=min(host_total, pin_budget),
+                kv_reserve_bytes=reserve_bytes,
+                expert_bytes_per_slot=per_slot,
+                host_bytes_per_layer=(per_layer,) * layers,
+                gpu_bytes_per_layer=(per_layer,) * layers,
+                num_experts=experts,
+                prefill_overlap=config.moe_prefill_overlap,
+                dynamic_cache_slots=requested_dynamic,
+                kv_page_bytes=cache_per_page,
+                kv_reserve_pages=reserve_pages,
+            ),
+            caps,
+            policy=config.moe_placement_policy,
+            allow_gpu_permanent=(requested_permanent != 0 and not (manual and requested_permanent < 0)),
+            explicit_permanent_layer_count=(
+                requested_permanent if requested_permanent > 0 else None
+            ),
+            explicit_cpu_layer_ids=explicit_cpu_layer_ids,
+            allow_additional_cpu_layers=(
+                not manual
+                and config.moe_cpu_layers is None
+                and config.moe_backend != "cpu"
+            ),
+        )
+        object.__setattr__(config, "moe_cache_size", plan.dynamic_cache_slots)
+        object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
+        if config.num_page_override is None:
+            object.__setattr__(config, "num_page_override", plan.kv_pages)
+        self.moe_placement_plan = plan
+        logger.info_rank0(
+            "MoE placement plan\n"
+            f"  GPU permanent:      {len(plan.permanent_layer_ids)} layers / "
+            f"{mem_GB(plan.permanent_gpu_bytes)} per rank\n"
+            f"  host retained:      {len(plan.layer_tiers) - len(plan.permanent_layer_ids)} "
+            f"layers / {mem_GB(plan.retained_host_bytes)} per rank\n"
+            f"    pinned:           {mem_GB(plan.pinned_host_bytes)}\n"
+            f"    locked:           {mem_GB(plan.locked_host_bytes)}\n"
+            f"  dynamic GPU cache:  {plan.dynamic_cache_slots} slots "
+            f"(floor {plan.dynamic_floor_slots})\n"
+            f"  KV reserve/plan:    {reserve_pages}/{plan.kv_pages} pages\n"
+            f"  prefill overlap:    {plan.prefill_overlap}\n"
+            f"  decisions:          {'; '.join(plan.decisions) or 'all-host baseline'}"
+        )
+        return plan
+
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
         # Otherwise load_expert_banks gives the model module a setup hook first, then
@@ -527,6 +659,12 @@ class Engine:
                 "--moe-cache-auto is not supported for models with a custom "
                 "make_offload_moe_cache; pass --moe-cache-size explicitly."
             )
+        placement_plan = None
+        specs = None
+        if cache_factory is None:
+            from freetoken.moe.expert_banks import expert_bank_specs
+
+            specs = expert_bank_specs(config.model_config)
         # decode_target picks the bank layout + the per-decode mechanism:
         #   "hybrid" -> GPU-cache + CPU-overflow co-compute, every layer (--moe-backend hybrid);
         #   "cpu"    -> CPU executor for the cpu_layer_ids set (all layers under --moe-backend
@@ -541,8 +679,14 @@ class Engine:
             and config.moe_cpu_layers is None
             and config.moe_backend in ("offload", "hybrid")
             and _pin_budget_bytes() is not None
+            and specs is None
         ):
             cpu_layer_ids = _auto_cpu_layers(config, config.model_config.num_moe_layers)
+        if specs is not None:
+            placement_plan = self._resolve_startup_moe_placement(
+                config, specs, cpu_layer_ids
+            )
+            cpu_layer_ids = placement_plan.cpu_layer_ids
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -555,9 +699,9 @@ class Engine:
         split_residency = (
             bool(cpu_layer_ids)
             and config.moe_backend in ("offload", "hybrid")
-            and _pin_budget_bytes() is not None
+            and (placement_plan is not None or _pin_budget_bytes() is not None)
         )
-        if config.moe_backend == "cpu" and not split_residency:
+        if config.moe_backend == "cpu" and not split_residency and placement_plan is None:
             # cpu mode pins every bank for the prefill double buffer; over the pin cap that dies in cudaHostRegister, so lock everything instead
             from freetoken.moe.expert_banks import bank_bytes_estimate, ftw_bank_bytes
 
@@ -579,9 +723,6 @@ class Engine:
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         if cache_factory is None:
-            from freetoken.engine.cache_budget import plan_gpu_only_layers
-            from freetoken.moe.expert_banks import expert_bank_specs
-
             # Fast path: an FTW checkpoint loads its repacked banks directly.
             # Slow path: load_expert_banks auto-picks parallel vs serial baseline by
             # expert-tensor granularity. Both pin-after-fill.
@@ -589,7 +730,19 @@ class Engine:
             # pick (parallel for scattered experts, with a low-RAM fallback to serial).
             expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
             requested_residency = None
-            if split_residency:
+            if placement_plan is not None:
+                from freetoken.engine.moe_placement import ExpertTier
+                from freetoken.moe.host_banks import HostResidency
+
+                requested_residency = [
+                    HostResidency.GPU_ONLY.value
+                    if tier is ExpertTier.GPU_PERMANENT
+                    else HostResidency.LOCKED.value
+                    if tier is ExpertTier.HOST_LOCKED
+                    else HostResidency.PINNED.value
+                    for tier in placement_plan.layer_tiers
+                ]
+            elif split_residency:
                 from freetoken.moe.host_banks import HostResidency
 
                 requested_residency = [
@@ -597,10 +750,11 @@ class Engine:
                     else HostResidency.PINNED.value
                     for i in range(config.model_config.num_moe_layers)
                 ]
-            specs = expert_bank_specs(config.model_config)
-            pre_resolved_auto = config.moe_cache_auto and specs is not None
+            pre_resolved_auto = placement_plan is not None or (
+                config.moe_cache_auto and specs is not None
+            )
             expected_format = getattr(config.model_config, "expert_quant", None)
-            if pre_resolved_auto:
+            if placement_plan is None and pre_resolved_auto:
                 # DSV4 exposes exact per-rank bank geometry, so solve the slot/KV
                 # split before host experts exist. That in turn lets selected
                 # layers stream directly into their final GPU ranges.
@@ -622,50 +776,22 @@ class Engine:
                     f"--moe-cache-auto resolved moe_cache_size={size} "
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
-            if specs is not None or not config.moe_cache_auto:
+            if (specs is not None or not config.moe_cache_auto) and not (
+                placement_plan is not None and not placement_plan.dynamic_cache_slots
+            ):
                 _require_offload_cache_size(
                     config.moe_cache_size, config.model_config.num_experts
                 )
 
             requested_gpu_only = getattr(config, "moe_gpu_only_layers", -1)
-            gpu_only_ids: tuple[int, ...] = ()
-            if requested_gpu_only != 0:
-                if decode_target != "gpu":
-                    if requested_gpu_only > 0:
-                        raise ValueError(
-                            "--moe-gpu-only-layers requires pure --moe-backend offload; "
-                            "CPU/hybrid decode needs host backing for every layer"
-                        )
-                elif specs is None:
-                    if requested_gpu_only > 0:
-                        raise ValueError(
-                            "--moe-gpu-only-layers is not implemented for this expert format"
-                        )
-                else:
-                    from freetoken.checkpoint.ftw import is_ftw_checkpoint
-
-                    if (
-                        config.model_path
-                        and is_ftw_checkpoint(config.model_path)
-                        and not config.use_dummy_weight
-                    ):
-                        if requested_gpu_only > 0:
-                            raise ValueError(
-                                "--moe-gpu-only-layers currently requires the original "
-                                "DeepSeek-V4 safetensors checkpoint, not FTW"
-                            )
-                        logger.warning_rank0(
-                            "GPU-only expert layers are unavailable for FTW input; retaining "
-                            "host backing for every layer"
-                        )
-                    else:
-                        gpu_only_ids = plan_gpu_only_layers(
-                            cache_size=config.moe_cache_size,
-                            num_experts=config.model_config.num_experts,
-                            num_layers=config.model_config.num_moe_layers,
-                            prefill_overlap=config.moe_prefill_overlap,
-                            requested=requested_gpu_only,
-                        )
+            gpu_only_ids: tuple[int, ...] = (
+                placement_plan.permanent_layer_ids if placement_plan is not None else ()
+            )
+            if placement_plan is None and requested_gpu_only != 0:
+                if requested_gpu_only > 0:
+                    raise ValueError(
+                        "--moe-gpu-only-layers is not implemented for this expert provider"
+                    )
             if (
                 len(gpu_only_ids) == config.model_config.num_moe_layers
                 and config.moe_prefill_overlap
@@ -675,6 +801,21 @@ class Engine:
                 # needs no copy overlap at all.
                 object.__setattr__(config, "moe_prefill_overlap", False)
 
+            # Permanent rows used to occupy a protected tail in the unified
+            # slot count.  From here on cache_size denotes only the independently
+            # rebuildable allocation; PermanentExpertStore owns the fixed rows.
+            all_gpu_permanent = (
+                len(gpu_only_ids) == config.model_config.num_moe_layers
+            )
+            if placement_plan is not None:
+                dynamic_cache_size = placement_plan.dynamic_cache_slots
+            else:
+                permanent_slots = len(gpu_only_ids) * config.model_config.num_experts
+                dynamic_cache_size = config.moe_cache_size - permanent_slots
+                if all_gpu_permanent:
+                    dynamic_cache_size = 0
+            object.__setattr__(config, "moe_cache_size", dynamic_cache_size)
+
             cache = None
             if specs is not None:
                 cache = OffloadMoeCache(
@@ -682,7 +823,7 @@ class Engine:
                     # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
                     num_layers=config.model_config.num_moe_layers,
                     num_experts=config.model_config.num_experts,
-                    cache_size=config.moe_cache_size,
+                    cache_size=dynamic_cache_size,
                     device=self.device,
                     cache_policy=config.moe_cache_policy,
                     prefill_overlap=config.moe_prefill_overlap,
@@ -690,6 +831,7 @@ class Engine:
                     quant_format=expected_format,
                     decode_target=decode_target,
                     hybrid_max_fetch=config.moe_hybrid_max_fetch,
+                    allow_empty_dynamic=all_gpu_permanent,
                 )
             if gpu_only_ids:
                 from freetoken.engine.cache_budget import expert_bytes_per_slot_from_specs
@@ -745,9 +887,10 @@ class Engine:
                     f"--moe-cache-auto resolved moe_cache_size={size} "
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
-            _require_offload_cache_size(
-                config.moe_cache_size, config.model_config.num_experts
-            )
+            if not all_gpu_permanent:
+                _require_offload_cache_size(
+                    config.moe_cache_size, config.model_config.num_experts
+                )
             if cache is None:
                 # Formats without allocation-only specs retain the existing
                 # load-first path and construct the cache from the actual banks.
@@ -772,6 +915,17 @@ class Engine:
             cache.cpu_layer_ids = cpu_layer_ids
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
+            if placement_plan is not None:
+                actual = tuple(cache.layer_residency)
+                requested = tuple(requested_residency or ())
+                if actual != requested:
+                    logger.warning_rank0(
+                        "MoE actual residency differs from requested placement "
+                        f"(requested={requested}, actual={actual}); OS lock fallback is "
+                        "reported as pageable"
+                    )
+                else:
+                    logger.info_rank0("MoE actual residency matches the requested placement plan")
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
@@ -997,7 +1151,15 @@ class Engine:
             config, num_pages=num_pages,
             num_swa_pages=num_swa_pages, target_moe=target_moe,
             per_expert_bytes=per_expert_bytes, baseline_free=self._baseline_free,
-            weights_bytes=self._weights_bytes, current_num_pages=self.num_pages,
+            weights_bytes=(
+                self._weights_bytes
+                + (
+                    self.moe_offload_cache.permanent_store.nbytes
+                    if self.moe_offload_cache is not None
+                    and self.moe_offload_cache.permanent_store is not None
+                    else 0
+                )
+            ), current_num_pages=self.num_pages,
             extra_fixed_bytes=(
                 state_pool_bytes(config, target_mamba) if target_mamba is not None else 0
             ),
@@ -1357,6 +1519,10 @@ _DENSE_MOE_SETTINGS = {
     "moe_cache_size": 0,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
+    "moe_placement": "auto",
+    "moe_host_budget_gb": None,
+    "moe_pin_budget_gb": None,
+    "moe_placement_policy": "balanced",
     "moe_gpu_only_layers": -1,
     "moe_cpu_layers": None,
     "moe_cpu_threads": 0,

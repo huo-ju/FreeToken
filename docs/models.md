@@ -46,8 +46,8 @@ rank but shards each expert's SwiGLU intermediate dimension. A TP=4 process
 therefore holds one quarter of every host expert bank and one quarter of every
 GPU expert slot; the partial routed outputs are summed across the four GPUs.
 
-The offload cache also has a GPU-only tier. Complete expert layers assigned to
-that tier are copied into protected cache slots as soon as the layer finishes
+The placement planner also has a GPU-permanent tier. Complete expert layers assigned to
+that tier are copied into a separate immutable allocation as soon as the layer finishes
 loading, then their anonymous host pages are discarded. With `R` resident
 layers, aggregate expert host backing is approximately:
 
@@ -61,10 +61,11 @@ each GPU. Every layer moved to the GPU-only tier removes 3.1875 GiB of aggregate
 host backing; keeping all layers host-backed would require about 137.06 GiB for
 the routed experts alone.
 
-`--moe-gpu-only-layers auto` is the default. It uses every complete layer that
-fits after reserving one dynamic layer, or two while prefill-copy overlap is
-enabled. `--moe-gpu-only-layers N` makes the requested count strict, and `0`
-keeps the traditional all-host-backed layout.
+`--moe-gpu-only-layers auto` is the default compatibility setting. It permits
+the planner to use the minimum number of complete layers required by the host
+and pin budgets; it no longer consumes every layer that happens to fit in VRAM.
+`--moe-gpu-only-layers N` makes the requested count strict, and `0` keeps the
+traditional all-host-backed layout (or reports the host budget as infeasible).
 
 For a low-concurrency TP=4 deployment, an explicit layout can be selected with:
 
@@ -74,7 +75,9 @@ ft serve \
   --tp-size 4 \
   --moe-backend offload \
   --nvfp4-backend triton \
-  --moe-cache-size 4352 \
+  --moe-placement auto \
+  --moe-host-budget-gb 96 \
+  --moe-cache-size 256 \
   --moe-gpu-only-layers auto \
   --expert-load serial \
   --disable-moe-prefill-overlap \
@@ -86,19 +89,17 @@ ft serve \
   --memory-ratio 1.0
 ```
 
-This allocates 17 layer-equivalents of cache: one remains dynamic and 16 complete
-layers (27 through 42) become GPU-only. It releases 51.00 GiB of aggregate host
-pages and retains about 86.06 GiB of routed-expert backing. Treat this as a
-capacity example rather than a portable preset: reduce the cache or token budget
-on smaller GPUs, and add resident layers only when both the VRAM budget and one
-dynamic layer still fit.
+This asks for one rebuildable dynamic layer and caps retained expert backing at
+96 GiB aggregate. At the published geometry the planner needs 13 permanent
+layers to cover the roughly 41.06 GiB host deficit, subject to the fixed-model,
+KV and activation VRAM floors. Treat this as capacity arithmetic rather than a
+portable preset: the planner rejects the configuration before expert loading if
+the measured GPU budget cannot prove it fits.
 
 `--disable-moe-prefill-overlap` trades prefill H2D/GEMM overlap for one fewer
-dynamic layer buffer, making one additional complete layer eligible for the
-GPU-only tier. `--moe-cache-auto` remains useful when VRAM is the only
-constraint, but it does not infer how much host RAM the checkpoint needs; use
-an explicit cache size when GPU residency is required to make the model fit in
-host memory.
+dynamic layer buffer. `--moe-cache-auto` jointly sizes the dynamic cache and KV
+pool after subtracting the permanent floor; explicit host and pin budgets remain
+hard constraints.
 
 Multi-GPU DSV4 currently requires the original safetensors checkpoint. Existing
 FTW expert banks contain a TP=1 physical layout, so the server rejects them for

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-import threading
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -102,6 +101,9 @@ class OffloadMoeCache:
     device: torch.device
     cache_policy: str = "lru"
     prefill_overlap: bool = False
+    # Full GPU-authoritative placement can legitimately have no dynamic slots.
+    # Ordinary host-backed caches retain the one-layer floor.
+    allow_empty_dynamic: bool = False
     # Prefill hit/miss split: experts already resident in the slot cache (slots
     # >= 2 * num_experts) are gathered device-side into the double buffer instead
     # of re-crossing PCIe; only the misses are H2D'd (one cudaMemcpyBatchAsync of
@@ -144,14 +146,10 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
-        # Whole expert layers that live exclusively in protected slots at the
-        # tail of the GPU cache. Their host pages are discarded after the loader
-        # stages them, so these mappings must survive resets and may never be
-        # selected as LRU victims.
+        # GPU-authoritative layers live in a physically independent immutable
+        # allocation.  They never enter slot maps, LRU state, or cache rebuilds.
         self.gpu_resident_layer_ids: frozenset[int] = frozenset()
-        self._gpu_resident_slots: dict[int, int] = {}
-        self._gpu_resident_loaded: set[int] = set()
-        self._gpu_resident_copy_lock = threading.Lock()
+        self.permanent_store = None
         self.dynamic_cache_size = self.cache_size
         self.expert_bytes_per_slot = 0
         # MoE layer ids whose decode runs on the CPU executor; the rest use the GPU
@@ -292,16 +290,15 @@ class OffloadMoeCache:
         specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
         layer_ids: list[int] | tuple[int, ...],
     ) -> None:
-        """Allocate slot banks up front and reserve protected whole-layer ranges.
+        """Allocate immutable permanent banks independently from dynamic slots.
 
         ``specs`` describes one host layer per bank as ``([E, ...], dtype)``.
-        The selected layers are assigned contiguous expert-ordered ranges at the
-        cache tail, leaving the prefix for the ordinary LRU and (when enabled)
-        the two prefill buffers. The loader can then call
+        The dynamic cache keeps its requested size and owns no permanent rows.
+        The loader can call
         :meth:`stage_gpu_resident_layer` as each selected layer completes and
         immediately discard that layer's host pages.
         """
-        if self.bank_caches or self.bank_sources:
+        if self.bank_caches or self.bank_sources or self.permanent_store is not None:
             raise RuntimeError("GPU-resident layout must be prepared before bank sources")
         if set(specs) != set(self.bank_schema):
             raise ValueError(
@@ -311,39 +308,18 @@ class OffloadMoeCache:
         ids = tuple(sorted(set(int(x) for x in layer_ids)))
         if any(x < 0 or x >= self.num_layers for x in ids):
             raise ValueError(f"GPU-only layer ids {ids} outside [0, {self.num_layers})")
-        resident_slots = len(ids) * self.num_experts
-        dynamic = self.cache_size - resident_slots
-        if dynamic < 0:
-            raise ValueError(
-                f"{len(ids)} GPU-only layers need {resident_slots} slots, "
-                f"but cache_size is {self.cache_size}"
-            )
-        if len(ids) < self.num_layers:
-            floor = (2 if self.prefill_overlap else 1) * self.num_experts
-            if dynamic < floor:
-                raise ValueError(
-                    f"GPU-only layers leave {dynamic} dynamic slots; {floor} are required "
-                    f"(prefill_overlap={self.prefill_overlap})"
-                )
         self.gpu_resident_layer_ids = frozenset(ids)
-        self.dynamic_cache_size = dynamic
-        self._gpu_resident_slots = {
-            layer_id: dynamic + i * self.num_experts for i, layer_id in enumerate(ids)
-        }
-        for name in self.bank_schema:
-            shape, dtype = specs[name]
-            if not shape or shape[0] != self.num_experts:
-                raise ValueError(
-                    f"bank {name!r} spec must start with num_experts={self.num_experts}; "
-                    f"got {shape}"
-                )
-            self.bank_caches[name] = torch.empty(
-                (self.cache_size, *shape[1:]), dtype=dtype, device=self.device
-            )
-        self.expert_bytes_per_slot = sum(
-            math.prod(shape[1:]) * torch.empty((), dtype=dtype).element_size()
-            for shape, dtype in specs.values()
+        from freetoken.moe.permanent_store import PermanentExpertStore
+
+        self.permanent_store = PermanentExpertStore(
+            num_layers=self.num_layers,
+            num_experts=self.num_experts,
+            layer_ids=ids,
+            bank_schema=self.bank_schema,
+            specs=specs,
+            device=self.device,
         )
+        self.expert_bytes_per_slot = self.permanent_store.expert_bytes_per_slot
 
     def stage_gpu_resident_layer(
         self, layer_id: int, tensors: dict[str, torch.Tensor]
@@ -354,30 +330,9 @@ class OffloadMoeCache:
         because the caller drops the source mmap pages immediately afterwards.
         Startup is I/O-bound and this path runs only once per resident layer.
         """
-        if layer_id not in self.gpu_resident_layer_ids:
-            raise ValueError(f"layer {layer_id} was not reserved as GPU-only")
-        if set(tensors) != set(self.bank_schema):
-            raise ValueError(
-                f"layer {layer_id} banks {sorted(tensors)} do not match {self.bank_schema}"
-            )
-        base = self._gpu_resident_slots[layer_id]
-        with self._gpu_resident_copy_lock:
-            if layer_id in self._gpu_resident_loaded:
-                raise RuntimeError(f"GPU-only expert layer {layer_id} was staged twice")
-            if self.device.type == "cuda":
-                torch.cuda.set_device(self.device)
-            for name in self.bank_schema:
-                source = tensors[name]
-                target = self.bank_caches[name][base:base + self.num_experts]
-                if source.shape != target.shape or source.dtype != target.dtype:
-                    raise ValueError(
-                        f"GPU-only bank {name!r} layer {layer_id}: source "
-                        f"{source.shape}/{source.dtype}, target {target.shape}/{target.dtype}"
-                    )
-                target.copy_(source, non_blocking=False)
-            if self.device.type == "cuda":
-                torch.cuda.current_stream(self.device).synchronize()
-            self._gpu_resident_loaded.add(layer_id)
+        if self.permanent_store is None:
+            raise RuntimeError("GPU permanent store was not prepared")
+        self.permanent_store.stage(layer_id, tensors)
 
     def set_bank_sources(
         self,
@@ -424,9 +379,8 @@ class OffloadMoeCache:
                 f"GPU-only residency labels {sorted(labelled_gpu)} do not match prepared "
                 f"layers {sorted(self.gpu_resident_layer_ids)}"
             )
-        if self._gpu_resident_loaded != set(self.gpu_resident_layer_ids):
-            missing = sorted(set(self.gpu_resident_layer_ids) - self._gpu_resident_loaded)
-            raise RuntimeError(f"GPU-only expert layers were not staged: {missing}")
+        if self.permanent_store is not None:
+            self.permanent_store.validate_complete()
         unpinned = frozenset(
             i for i, r in enumerate(residency)
             if r in (HostResidency.LOCKED.value, HostResidency.PAGEABLE.value)
@@ -459,27 +413,17 @@ class OffloadMoeCache:
                 source if residency[layer_id] != HostResidency.GPU_ONLY.value else None
                 for layer_id, source in enumerate(per_layer)
             ]
-            if name in self.bank_caches:
-                cache = self.bank_caches[name]
-                expected = (self.cache_size, *head.shape[1:])
-                if cache.shape != expected or cache.dtype != head.dtype:
-                    raise ValueError(
-                        f"prepared cache bank {name!r} is {cache.shape}/{cache.dtype}; "
-                        f"sources require {expected}/{head.dtype}"
-                    )
-            else:
-                self.bank_caches[name] = torch.empty(
-                    (self.cache_size, *head.shape[1:]),
-                    dtype=head.dtype,
-                    device=self.device,
-                )
+            self.bank_caches[name] = torch.empty(
+                (self.cache_size, *head.shape[1:]),
+                dtype=head.dtype,
+                device=self.device,
+            )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
         if not self.expert_bytes_per_slot:
             self.expert_bytes_per_slot = sum(
                 math.prod(cache.shape[1:]) * cache.element_size()
                 for cache in self.bank_caches.values()
             )
-        self._restore_gpu_resident_mappings()
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
@@ -547,32 +491,14 @@ class OffloadMoeCache:
             self._gather_feat_bytes = self._copy_feat_bytes[self._gather_bank_ids].contiguous()
         self._copy_fused_ok = True
 
-    def _restore_gpu_resident_mappings(self) -> None:
-        """Reinstall permanent id/slot maps and the non-evictable LRU sentinel."""
-        if not self.gpu_resident_layer_ids:
-            return
-        sentinel = torch.iinfo(torch.int64).max
-        experts = torch.arange(self.num_experts, dtype=torch.int32, device=self.device)
-        for layer_id in sorted(self.gpu_resident_layer_ids):
-            base = self._gpu_resident_slots[layer_id]
-            slots = experts + base
-            self.slot_for_id[layer_id].copy_(slots)
-            self.id_of_slot[base:base + self.num_experts].copy_(
-                experts + layer_id * self.num_experts
-            )
-            self.usage[base:base + self.num_experts].fill_(sentinel)
-
     def is_gpu_resident_layer(self, layer_id: int) -> bool:
-        return layer_id in self.gpu_resident_layer_ids
+        return self.permanent_store is not None and self.permanent_store.contains(layer_id)
 
     def gpu_resident_views(self, layer_id: int) -> tuple[torch.Tensor, ...]:
-        """Expert-ordered ``[E, ...]`` views for one protected GPU-only layer."""
-        if layer_id not in self.gpu_resident_layer_ids:
-            raise ValueError(f"layer {layer_id} is not GPU-only")
-        base = self._gpu_resident_slots[layer_id]
-        return tuple(
-            self.bank_caches[name][base:base + self.num_experts] for name in self.bank_schema
-        )
+        """Expert-ordered ``[E, ...]`` views from the immutable store."""
+        if self.permanent_store is None:
+            raise ValueError(f"layer {layer_id} is not GPU permanent")
+        return self.permanent_store.views(layer_id)
 
     def validate_rebuild(self, cache_size: int) -> None:
         """Pure geometry validation of a rebuild target (no GPU side effects).
@@ -582,12 +508,11 @@ class OffloadMoeCache:
         pre-teardown check, so an invalid target rejects with the old cache intact
         (no destructive free first).
         """
-        if cache_size < self.num_experts:
+        if cache_size < self.num_experts and not (self.allow_empty_dynamic and cache_size == 0):
             raise ValueError(f"cache_size {cache_size} < num_experts {self.num_experts}")
-        if self.gpu_resident_layer_ids and cache_size != self.cache_size:
+        if len(self.gpu_resident_layer_ids) == self.num_layers and cache_size != 0:
             raise ValueError(
-                "moe_cache_size cannot be changed after GPU-only expert layers discard "
-                "their host backing; rebuild with the existing MoE size or restart the engine"
+                "all expert layers are GPU permanent, so the dynamic cache must remain empty"
             )
         if self.quant_format == "nvfp4_marlin" and cache_size > MARLIN_MAX_CACHE_SIZE:
             raise ValueError(
@@ -993,11 +918,11 @@ class OffloadMoeCache:
         ensure_experts(self, layer_id, expert_ids)
 
     def map_gpu_resident_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        """Rewrite raw expert ids to protected slots without touching the LRU.
+        """Record routing stats while keeping expert ids in expert order.
 
-        Calling the ordinary LRU hit path would refresh ``usage`` from the
-        permanent max-int sentinel to the current step, making a GPU-only slot
-        evictable. Resident layers therefore use this cheaper affine mapping.
+        Permanent banks are physically separate from slot cache rows, so their
+        kernels consume raw expert ids directly.  Kept as a compatibility shim
+        for callers that used the former protected-tail mapping API.
         """
         if layer_id not in self.gpu_resident_layer_ids:
             raise ValueError(f"layer {layer_id} is not GPU-only")
@@ -1009,7 +934,6 @@ class OffloadMoeCache:
             self.active_mask.scatter_(0, raw, 1)
             self.lru_stats[layer_id, Stat.ACTIVE] += self.active_mask.sum()
             self.lru_stats[layer_id, Stat.CALLS] += 1
-        expert_ids.add_(self._gpu_resident_slots[layer_id])
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -1047,7 +971,6 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
-        self._restore_gpu_resident_mappings()
         # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
         # it here so a new sequence starts with cold hybrid fetch priorities.
         self.expert_recency.fill_(-1)
@@ -1177,9 +1100,7 @@ class OffloadMoeCache:
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if self.is_gpu_resident_layer(layer_id):
-            # Every id in this layer already maps to a protected slot, so ensure
-            # emits zero copies. Returning here also makes the no-host-source
-            # invariant explicit instead of trusting an empty copy plan.
+            # Permanent rows never enter the pending dynamic-copy state.
             return
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:

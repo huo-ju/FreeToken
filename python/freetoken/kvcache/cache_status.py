@@ -36,12 +36,16 @@ def compute_cache_unit_bytes(engine: "Engine") -> Dict[str, int]:
         return int(kv), int(swa)
 
     def _moe() -> int:
-        banks = getattr(engine.moe_offload_cache, "bank_caches", None)
-        if not banks:
+        cache = engine.moe_offload_cache
+        if cache is None:
             return 0
-        # Each bank cache is (cache_size, *row_shape); one slot's bytes = row bytes summed over
-        # the format's banks (== cache_budget.expert_bytes_per_slot on the source rows).
-        return int(sum(t[0].numel() * t.element_size() for t in banks.values()))
+        measured = int(getattr(cache, "expert_bytes_per_slot", 0) or 0)
+        if measured:
+            return measured
+        banks = getattr(cache, "bank_caches", None) or {}
+        return int(
+            sum(t.numel() * t.element_size() // max(1, int(t.shape[0])) for t in banks.values())
+        )
 
     def _mamba() -> int:
         pool = engine.linear_state_pool
@@ -110,6 +114,10 @@ def compute_cache_floors(engine: "Engine") -> Dict[str, int]:
     def _moe() -> int:
         if engine.moe_offload_cache is None:
             return 0
+        if len(getattr(engine.moe_offload_cache, "gpu_resident_layer_ids", ())) == int(
+            config.model_config.num_moe_layers
+        ):
+            return 0
         return int(config.model_config.num_experts)
 
     def _mamba() -> int:
@@ -154,6 +162,7 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
     pools = {
         "num_pages": 0, "page_size": 0, "moe_cache_size": 0, "num_mamba_slots": 0,
         "swa_page_size": 0, "num_swa_pages": 0,
+        "moe_permanent_bytes": 0, "moe_permanent_layers": 0,
     }
     try:
         config = engine.config
@@ -176,6 +185,10 @@ def compute_cache_pools(engine: "Engine") -> Dict[str, int]:
         moe = engine.moe_offload_cache
         if moe is not None:
             pools["moe_cache_size"] = int(moe.cache_size or 0)
+            store = getattr(moe, "permanent_store", None)
+            if store is not None:
+                pools["moe_permanent_bytes"] = int(store.nbytes)
+                pools["moe_permanent_layers"] = len(store.layer_ids)
         lsp = engine.linear_state_pool
         if lsp is not None:
             pools["num_mamba_slots"] = max(0, int(lsp.num_slots or 0) - 1)
@@ -194,6 +207,24 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)
+    plan = getattr(engine, "moe_placement_plan", None)
+    if plan is not None:
+        meta["moe_placement"] = {
+            "layer_tiers": [tier.value for tier in plan.layer_tiers],
+            "permanent_layer_ids": list(plan.permanent_layer_ids),
+            "cpu_layer_ids": sorted(plan.cpu_layer_ids),
+            "permanent_gpu_bytes": plan.permanent_gpu_bytes,
+            "retained_host_bytes": plan.retained_host_bytes,
+            "pinned_host_bytes": plan.pinned_host_bytes,
+            "locked_host_bytes": plan.locked_host_bytes,
+            "dynamic_floor_slots": plan.dynamic_floor_slots,
+            "constraints": list(plan.constraints),
+            "decisions": list(plan.decisions),
+            "warnings": list(plan.warnings),
+            "actual_layer_residency": list(
+                getattr(getattr(engine, "moe_offload_cache", None), "layer_residency", ())
+            ),
+        }
     # Current window/full reuse ratio (the tunable knob), for DSV4 and radix-SWA; 0.0 otherwise.
     cfg = engine.config
     has_swa_ratio = cfg is not None and _supports_swa_ratio(cfg)
@@ -208,6 +239,9 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     try:
         _baseline = int(engine._baseline_free or 0)
         _weights = int(engine._weights_bytes or 0)
+        _store = getattr(getattr(engine, "moe_offload_cache", None), "permanent_store", None)
+        if _store is not None:
+            _weights += int(_store.nbytes)
         _mr = float(cfg.memory_ratio) if cfg is not None else 1.0
         meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this

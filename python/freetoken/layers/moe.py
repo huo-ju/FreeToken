@@ -310,9 +310,9 @@ class OffloadMoELayer(MoELayer):
                 hidden_states,
                 topk_weights,
                 topk_ids,
-                views=cache.bank_views(),
-                n=None,
-                alphas=cache.alphas_for_slots(self.layer_id),
+                views=cache.gpu_resident_views(self.layer_id),
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
                 is_prefill=False,
             )
         if cache.is_cpu_layer(self.layer_id):

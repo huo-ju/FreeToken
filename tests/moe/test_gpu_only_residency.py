@@ -7,59 +7,6 @@ import pytest
 import torch
 
 
-def test_gpu_only_layer_plan_preserves_dynamic_prefill_floor():
-    from freetoken.engine.cache_budget import plan_gpu_only_layers
-
-    # E=8, cache=42: two 8-slot prefill buffers + three complete resident
-    # layers, with two extra dynamic LRU slots left over.
-    assert plan_gpu_only_layers(
-        cache_size=42,
-        num_experts=8,
-        num_layers=7,
-        prefill_overlap=True,
-        requested=-1,
-    ) == (4, 5, 6)
-
-    with pytest.raises(ValueError, match="exceeds the 3 complete layers"):
-        plan_gpu_only_layers(
-            cache_size=42,
-            num_experts=8,
-            num_layers=7,
-            prefill_overlap=True,
-            requested=4,
-        )
-
-
-def test_gpu_only_layer_plan_can_cover_every_expert():
-    from freetoken.engine.cache_budget import plan_gpu_only_layers
-
-    assert plan_gpu_only_layers(
-        cache_size=24,
-        num_experts=8,
-        num_layers=3,
-        prefill_overlap=True,
-        requested=-1,
-    ) == (0, 1, 2)
-    assert plan_gpu_only_layers(
-        cache_size=24,
-        num_experts=8,
-        num_layers=3,
-        prefill_overlap=True,
-        requested=3,
-    ) == (0, 1, 2)
-
-    # With the exact same cache, keeping one host-backed layer would require
-    # two dynamic prefill buffers and therefore does not fit.
-    with pytest.raises(ValueError, match="dynamic cache floor"):
-        plan_gpu_only_layers(
-            cache_size=24,
-            num_experts=8,
-            num_layers=3,
-            prefill_overlap=True,
-            requested=2,
-        )
-
-
 def test_dsv4_tp4_bank_specs_are_quarter_sized(monkeypatch):
     import freetoken.distributed.info as info
     from freetoken.distributed import DistributedInfo
@@ -277,7 +224,7 @@ def test_gpu_only_host_bank_release_drops_resident_private_pages():
     assert resident_pages() <= pages * 0.1
 
 
-def test_gpu_only_cache_drops_host_reference_and_keeps_protected_mapping():
+def test_gpu_only_store_is_physically_separate_and_survives_dynamic_rebuild():
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -289,7 +236,7 @@ def test_gpu_only_cache_drops_host_reference_and_keeps_protected_mapping():
     cache = OffloadMoeCache(
         num_layers=L,
         num_experts=E,
-        cache_size=4,
+        cache_size=2,
         device=torch.device("cpu"),
         prefill_overlap=False,
     )
@@ -316,36 +263,38 @@ def test_gpu_only_cache_drops_host_reference_and_keeps_protected_mapping():
 
     assert cache.dynamic_cache_size == E
     assert cache.bank_sources["gate_up"][2] is None
-    assert cache.slot_for_id[2].tolist() == [2, 3]
-    assert cache.id_of_slot.tolist() == [-1, -1, 4, 5]
-    assert cache.usage[2:].tolist() == [torch.iinfo(torch.int64).max] * E
+    assert cache.slot_for_id[2].tolist() == [-1, -1]
+    assert cache.id_of_slot.tolist() == [-1, -1]
+    assert cache.bank_caches["gate_up"].shape[0] == E
     views = cache.gpu_resident_views(2)
     torch.testing.assert_close(views[0], resident["gate_up"])
     torch.testing.assert_close(views[1], resident["down"])
+    permanent_ptrs = tuple(view.data_ptr() for view in views)
+    assert permanent_ptrs[0] != cache.bank_caches["gate_up"].data_ptr()
 
     ids = torch.tensor([[1, 0]], dtype=torch.int32)
     cache.map_gpu_resident_experts(2, ids)
-    assert ids.tolist() == [[3, 2]]
-    assert cache.usage[2:].tolist() == [torch.iinfo(torch.int64).max] * E
+    assert ids.tolist() == [[1, 0]]
 
-    # Normal admissions may recycle only the dynamic prefix. The permanent
-    # max-int usage sentinel keeps the hostless layer out of the victim set.
+    # Normal admissions only see the independent dynamic allocation.
     from freetoken.moe.offload_kernels import _ensure_experts_hybrid_cpu
 
     dynamic_ids = torch.tensor([[0, 1]], dtype=torch.int32)
     _ensure_experts_hybrid_cpu(cache, 0, dynamic_ids, max_fetch=2, frac_q16=0)
     assert sorted(dynamic_ids.reshape(-1).tolist()) == [0, 1]
-    assert cache.slot_for_id[2].tolist() == [2, 3]
-    assert cache.id_of_slot[2:].tolist() == [4, 5]
-    assert cache.usage[2:].tolist() == [torch.iinfo(torch.int64).max] * E
+    assert cache.slot_for_id[2].tolist() == [-1, -1]
 
-    with pytest.raises(ValueError, match="cannot be changed"):
-        cache.validate_rebuild(5)
+    cache.rebuild(3)
+    assert cache.cache_size == 3
+    rebuilt_views = cache.gpu_resident_views(2)
+    assert tuple(view.data_ptr() for view in rebuilt_views) == permanent_ptrs
+    torch.testing.assert_close(rebuilt_views[0], resident["gate_up"])
+    torch.testing.assert_close(rebuilt_views[1], resident["down"])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_flashlib_lru_does_not_evict_gpu_only_slots():
-    """Validate the max-int sentinel against the production GPU LRU kernel."""
+def test_flashlib_lru_never_owns_permanent_store_rows():
+    """The production LRU allocation contains dynamic rows only."""
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     E, L = 2, 3
@@ -356,24 +305,31 @@ def test_flashlib_lru_does_not_evict_gpu_only_slots():
     cache = OffloadMoeCache(
         num_layers=L,
         num_experts=E,
-        cache_size=4,
+        cache_size=2,
         device=torch.device("cuda:0"),
         prefill_overlap=False,
     )
     cache.prepare_gpu_resident_layers(specs, [2])
-    # The admission kernel only needs the maps; staging/data movement is covered
-    # separately by the cache residency test above.
-    cache._gpu_resident_loaded.add(2)
-    cache._restore_gpu_resident_mappings()
+    resident = {
+        "gate_up": torch.randn(E, 4, 4, dtype=torch.float16),
+        "down": torch.randn(E, 4, 2, dtype=torch.float16),
+    }
+    cache.stage_gpu_resident_layer(2, resident)
+    sources = {
+        name: [torch.zeros(shape, dtype=dtype).pin_memory() for _ in range(L)]
+        for name, (shape, dtype) in specs.items()
+    }
+    cache.set_bank_sources(sources, layer_residency=["pinned", "pinned", "gpu_only"])
+    permanent_ptrs = tuple(view.data_ptr() for view in cache.gpu_resident_views(2))
 
     for layer_id in (0, 1):
         ids = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda:0")
         cache.ensure_experts(layer_id, ids)
         torch.cuda.synchronize()
         assert sorted(ids.cpu().reshape(-1).tolist()) == [0, 1]
-        assert cache.slot_for_id[2].cpu().tolist() == [2, 3]
-        assert cache.id_of_slot[2:].cpu().tolist() == [4, 5]
-        assert cache.usage[2:].cpu().tolist() == [torch.iinfo(torch.int64).max] * E
+        assert cache.slot_for_id[2].cpu().tolist() == [-1, -1]
+        assert cache.id_of_slot.numel() == E
+        assert tuple(view.data_ptr() for view in cache.gpu_resident_views(2)) == permanent_ptrs
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

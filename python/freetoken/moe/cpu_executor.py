@@ -317,7 +317,7 @@ class CpuMoeExecutor:
             f"top_k={self.top_k} act={activation} max_tokens={self.max_tokens}"
         )
 
-    def _make_table(self, layers: list[torch.Tensor]) -> torch.Tensor:
+    def _make_table(self, layers: list[torch.Tensor | None]) -> torch.Tensor:
         """Build a CPU int64 tensor of per-layer base addresses for one bank.
 
         ``layers`` is one ``[num_experts, ...]`` tensor per layer (the per-layer host
@@ -327,9 +327,11 @@ class CpuMoeExecutor:
         executor's lifetime.
         """
         assert len(layers) == self.num_layers, (len(layers), self.num_layers)
-        table = torch.tensor([t.data_ptr() for t in layers], dtype=torch.int64)
+        table = torch.tensor(
+            [t.data_ptr() if t is not None else 0 for t in layers], dtype=torch.int64
+        )
         self._banks.append(table)
-        self._banks.extend(layers)
+        self._banks.extend(t for t in layers if t is not None)
         return table
 
     def _resolve_banks(self, banks: dict, fmt: str) -> tuple[dict, tuple[int, int]]:
@@ -464,15 +466,19 @@ class CpuMoeExecutor:
         activations (block 128) to match DSV4's W4A8 reference, hence the %128 dims."""
         gup, gus = banks["gate_up_packed"], banks["gate_up_scale"]
         dnp, dns = banks["down_packed"], banks["down_scale"]
-        assert gup[0].dtype == torch.uint8 and dnp[0].dtype == torch.uint8, (gup[0].dtype, dnp[0].dtype)
-        assert gus[0].element_size() == 1 and dns[0].element_size() == 1, "block scales must be 1 byte"
-        I = int(gup[0].shape[1] // 2)
-        H = int(gup[0].shape[2] * 2)
-        assert gup[0].shape[1] == 2 * I
+        gup0 = next(t for t in gup if t is not None)
+        gus0 = next(t for t in gus if t is not None)
+        dnp0 = next(t for t in dnp if t is not None)
+        dns0 = next(t for t in dns if t is not None)
+        assert gup0.dtype == torch.uint8 and dnp0.dtype == torch.uint8, (gup0.dtype, dnp0.dtype)
+        assert gus0.element_size() == 1 and dns0.element_size() == 1, "block scales must be 1 byte"
+        I = int(gup0.shape[1] // 2)
+        H = int(gup0.shape[2] * 2)
+        assert gup0.shape[1] == 2 * I
         assert H % 128 == 0 and I % 128 == 0, (H, I)  # FP8 activation round-trip block=128
-        assert tuple(dnp[0].shape[1:]) == (H, I // 2), (dnp[0].shape, H, I)
-        assert tuple(gus[0].shape[1:]) == (2 * I, H // 32), (gus[0].shape, I, H)
-        assert tuple(dns[0].shape[1:]) == (H, I // 32), (dns[0].shape, H, I)
+        assert tuple(dnp0.shape[1:]) == (H, I // 2), (dnp0.shape, H, I)
+        assert tuple(gus0.shape[1:]) == (2 * I, H // 32), (gus0.shape, I, H)
+        assert tuple(dns0.shape[1:]) == (H, I // 32), (dns0.shape, H, I)
         ptrs = dict(
             gate_up_ptr=self._make_table(gup).data_ptr(),
             down_ptr=self._make_table(dnp).data_ptr(),

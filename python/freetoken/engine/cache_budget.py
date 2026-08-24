@@ -57,52 +57,6 @@ def expert_bytes_per_slot_from_specs(
     return total
 
 
-def plan_gpu_only_layers(
-    *,
-    cache_size: int,
-    num_experts: int,
-    num_layers: int,
-    prefill_overlap: bool,
-    requested: int,
-) -> tuple[int, ...]:
-    """Choose whole layers whose host backing can be replaced by GPU slots.
-
-    Unless every expert fits, the plan preserves one dynamic full-layer buffer,
-    or two when prefill overlap is enabled. ``requested=-1`` consumes every
-    additional complete layer; ``0`` disables the tier; a positive request is
-    strict and fails rather than silently retaining more host RAM than asked.
-
-    The deepest layers are selected. DSV4's leading hash-routed layers tend to
-    have stronger short-term locality and benefit more from the dynamic LRU,
-    while every layer saves the same number of host bytes.
-    """
-    if requested < -1:
-        raise ValueError("moe_gpu_only_layers must be -1 (auto) or >= 0")
-    if requested == 0:
-        return ()
-    total = num_layers * num_experts
-    all_fit = cache_size >= total
-    dynamic_floor = (2 if prefill_overlap else 1) * num_experts
-    maximum_partial = min(
-        max(0, num_layers - 1),
-        max(0, (cache_size - dynamic_floor) // num_experts),
-    )
-    if requested == -1:
-        count = num_layers if all_fit else maximum_partial
-    else:
-        count = requested
-    # Full residency is a special geometry: no host-backed layer remains, so
-    # the engine disables prefill overlap and needs no dynamic buffer. A
-    # *partial* plan must still preserve the ordinary one/two-layer floor.
-    full_residency = count == num_layers and all_fit
-    if not full_residency and count > maximum_partial:
-        raise ValueError(
-            f"moe_gpu_only_layers={count} exceeds the {maximum_partial} complete layers that fit "
-            f"in cache_size={cache_size} while preserving the dynamic cache floor"
-        )
-    return tuple(range(num_layers - count, num_layers))
-
-
 def net_cache_budget_bytes(
     memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
 ) -> int:
