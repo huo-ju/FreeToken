@@ -46,10 +46,13 @@ class Attention(nn.Module):
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
         self.wkv = Linear(self.dim, self.head_dim, kind="fp8")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
+        # wo_a: checkpoint FP8 is dequantized through BF16, then the model loader
+        # casts it to the engine's native 16-bit compute dtype.
         wo_a_rows = self.n_groups * args.o_lora_rank
         wo_a_k = self.n_heads * self.head_dim // self.n_groups
-        self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
+        self.wo_a = nn.Parameter(
+            torch.empty(wo_a_rows, wo_a_k, dtype=args.compute_dtype), requires_grad=False
+        )
         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
         self.softmax_scale = self.head_dim ** -0.5
 

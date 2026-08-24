@@ -32,9 +32,14 @@ class Compressor(nn.Module):
         coff = 1 + self.overlap
 
         self.ape = nn.Parameter(torch.empty(compress_ratio, coff * self.head_dim, dtype=torch.float32), requires_grad=False)
-        # checkpoint stores these bf16; matmul upcasts on-chip (halves footprint + read).
-        self.wkv = Linear(self.dim, coff * self.head_dim, kind="bf16")
-        self.wgate = Linear(self.dim, coff * self.head_dim, kind="bf16")
+        # Checkpoint stores these as BF16. The model loader retains BF16 on
+        # Ampere+ or casts to FP16 on SM75; decode upcasts on-chip to FP32.
+        self.wkv = Linear(
+            self.dim, coff * self.head_dim, kind="bf16", compute_dtype=args.compute_dtype
+        )
+        self.wgate = Linear(
+            self.dim, coff * self.head_dim, kind="bf16", compute_dtype=args.compute_dtype
+        )
         self.norm = RMSNorm(self.head_dim, args.norm_eps)
         # Paged-KV binding (set on first forward). All addressing -- the compressed-KV pool view,
         # the per-window-page compress-state ring, the decode snapshot -- is reached through the
@@ -375,7 +380,9 @@ class Indexer(nn.Module):
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
         self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
-        self.weights_proj = Linear(self.dim, self.n_heads, kind="bf16")
+        self.weights_proj = Linear(
+            self.dim, self.n_heads, kind="bf16", compute_dtype=args.compute_dtype
+        )
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
         self.compressor = Compressor(args, compress_ratio, self.head_dim, rotate=True)

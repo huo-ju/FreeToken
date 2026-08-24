@@ -172,11 +172,13 @@ class Transformer(nn.Module):
         self.tp_size = tp.size
         self.vocab_size = args.vocab_size
         self.vocab_rows = div_ceil(args.vocab_size, tp.size)
-        self.embed = VocabParallelEmbedding(args.vocab_size, args.dim, torch.bfloat16)
+        self.embed = VocabParallelEmbedding(
+            args.vocab_size, args.dim, args.compute_dtype
+        )
         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
         self.norm = RMSNorm(args.dim, self.norm_eps)
         self.head = nn.Parameter(
-            torch.empty(self.vocab_rows, args.dim, dtype=torch.bfloat16),
+            torch.empty(self.vocab_rows, args.dim, dtype=args.compute_dtype),
             requires_grad=False,
         )
         self._comm = DistributedCommunicator()

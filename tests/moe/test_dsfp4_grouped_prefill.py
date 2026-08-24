@@ -128,3 +128,52 @@ def test_sparse_chunk_falls_back_to_gemv():
     ref = fmod.routed_experts_fp4(x, slots.clone(), w, gup, gus, dp, ds, LIMIT)
     out = fmod.routed_experts_fp4_prefill(x, slots.clone(), w, gup, gus, dp, ds, LIMIT, E)
     assert torch.equal(ref, out)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
+    reason="SM75 FP16 production path",
+)
+@pytest.mark.parametrize("T", [127, 128, 129])
+def test_sm75_fp16_grouped_switch_matches_gemv(T):
+    """The production top-6 path switches to grouped GEMM at exactly 128 tokens.
+
+    The grouped dequantizer must assemble native FP16 bits on Turing; treating its
+    historical BF16 bit pattern as FP16 inflates the output by hundreds of times
+    at T=128 while T=127 (the per-route fallback) remains correct.
+    """
+    import freetoken.moe.fused_ds_fp4 as fmod
+
+    device = "cuda"
+    experts, hidden, inter = 8, 1024, 512
+    g = torch.Generator(device="cpu").manual_seed(75 + T)
+
+    def u8(*shape, low=0, high=256):
+        return torch.randint(low, high, shape, dtype=torch.uint8, generator=g).to(device)
+
+    banks = (
+        u8(experts, 2 * inter, hidden // 2),
+        u8(experts, 2 * inter, hidden // 32, low=119, high=125),
+        u8(experts, hidden, inter // 2),
+        u8(experts, hidden, inter // 32, low=119, high=125),
+    )
+    x = (torch.randn(T, hidden, dtype=torch.float16, generator=g) * 0.1).to(device)
+    slots = torch.randint(
+        0, experts, (T, TOP_K), dtype=torch.int32, generator=g
+    ).to(device)
+    weights = torch.rand(T, TOP_K, generator=g)
+    weights = (weights / weights.sum(-1, keepdim=True)).to(device)
+
+    ref = fmod.routed_experts_fp4(
+        x, slots.clone(), weights, *banks, LIMIT
+    )
+    out = fmod.routed_experts_fp4_prefill(
+        x, slots.clone(), weights, *banks, LIMIT, experts
+    )
+    assert torch.isfinite(out).all()
+    diff = (out.float() - ref.float()).abs()
+    rel_rms = diff.square().mean().sqrt() / ref.float().square().mean().sqrt()
+    assert rel_rms.item() < 5e-3
+    assert torch.nn.functional.cosine_similarity(
+        out.float().flatten(), ref.float().flatten(), dim=0
+    ).item() > 0.999

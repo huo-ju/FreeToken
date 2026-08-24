@@ -27,7 +27,7 @@ class Gate(nn.Module):
         self.route_scale = args.route_scale
         self.hash = layer_id < args.n_hash_layers
         self.weight = nn.Parameter(
-            torch.empty(args.n_routed_experts, args.dim, dtype=torch.bfloat16),
+            torch.empty(args.n_routed_experts, args.dim, dtype=args.compute_dtype),
             requires_grad=False,
         )
         if self.hash:

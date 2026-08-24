@@ -14,13 +14,15 @@ FP8 = torch.float8_e4m3fn
 
 
 class Linear(nn.Module):
-    """BF16 / FP32 / block-scaled-FP8 linear (weight-only).
+    """Native-16 / FP32 / block-scaled-FP8 linear (weight-only).
 
     ``kind="fp8"``: weight float8_e4m3fn + 128x128 e8m0 ``scale`` (dequant in the
     Triton GEMM). ``kind="fp32"``/``"bf16"``: plain ``F.linear``.
     """
 
-    def __init__(self, in_features, out_features, bias=False, kind="fp8"):
+    def __init__(
+        self, in_features, out_features, bias=False, kind="fp8", compute_dtype=None
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -32,7 +34,14 @@ class Linear(nn.Module):
                 requires_grad=False,
             )
         else:
-            dtype = torch.float32 if kind == "fp32" else torch.bfloat16
+            # ``kind='bf16'`` names the checkpoint storage dialect. At runtime
+            # these plain weights follow the engine compute dtype: BF16 on
+            # Ampere+, FP16 on Turing/SM75.
+            dtype = (
+                torch.float32
+                if kind == "fp32"
+                else (compute_dtype or torch.get_default_dtype())
+            )
             self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype), requires_grad=False)
             self.register_parameter("scale", None)
         if bias:
