@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from freetoken.env import ENV
@@ -27,7 +29,21 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    # PyTorch's pip dependencies ship only the versioned ``libnccl.so.2`` (no
+    # linker-name ``libnccl.so`` symlink), and it lives inside site-packages
+    # rather than the system CUDA lib directory. Link that file directly and
+    # retain its directory as an rpath; fall back to the system linker contract
+    # for distro/toolkit installations.
+    ldflags = ["-lnccl"]
+    spec = importlib.util.find_spec("nvidia.nccl")
+    if spec is not None and spec.submodule_search_locations:
+        root = Path(next(iter(spec.submodule_search_locations)))
+        for name in ("libnccl.so", "libnccl.so.2"):
+            library = root / "lib" / name
+            if library.is_file():
+                ldflags = [str(library), f"-Wl,-rpath,{library.parent}"]
+                break
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=ldflags)
 
 
 @functools.cache
