@@ -415,7 +415,9 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        # This test exercises MoE cache-rate normalization, not an optional
+        # attention package. Keep it independent of flashinfer availability.
+        attention_backend="triton",
         moe_cache_rate=0.3,
     )
     object.__setattr__(

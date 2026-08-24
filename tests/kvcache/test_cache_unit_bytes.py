@@ -152,7 +152,10 @@ def _config(page_size=16, max_running_req=4, cache_type="hybrid_radix", num_expe
         max_running_req=max_running_req,
         cache_type=cache_type,
         model_config=SimpleNamespace(
-            num_experts=num_experts, dsv4_args=None, has_swa_attention=False
+            num_experts=num_experts,
+            num_moe_layers=10,
+            dsv4_args=None,
+            has_swa_attention=False,
         ),
     )
 
