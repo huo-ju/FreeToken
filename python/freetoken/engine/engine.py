@@ -10,7 +10,7 @@ import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
 from freetoken.core import Batch, Context, Req, set_global_ctx
 from freetoken.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from freetoken.gpu_select import gpu_identity
+from freetoken.gpu_select import bind_assigned_gpu, gpu_identity
 from freetoken.layers import set_rope_device
 from freetoken.models import create_model, load_weight
 from freetoken.moe import create_moe_backend, is_offload_moe_backend
@@ -290,16 +290,29 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _prepare_cuda_device(config: EngineConfig) -> torch.device:
+    """Bind this TP worker before any helper can query the current CUDA device.
+
+    SM75 policy/config resolution calls CUDA capability helpers.  If those run
+    before ``set_device``, every spawned TP worker creates a context on the
+    process default (physical GPU 0) before switching to its rank device.  The
+    stray contexts cost roughly 160 MiB each on GPU 0 for the process lifetime.
+
+    Selecting a device does not allocate through PyTorch's caching allocator,
+    so allocator settings can still be applied before the first tensor/stream
+    allocation while all device-sensitive probes now observe the correct rank.
+    """
+    assert not torch.cuda.is_initialized()
+    set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+    device = bind_assigned_gpu(config.tp_info.rank)
+    _ensure_expandable_segments()
+    _adjust_config(config)
+    return device
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
-        assert not torch.cuda.is_initialized()
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
-        _ensure_expandable_segments()  # before the first CUDA allocation below
-
-        from freetoken.gpu_select import bind_assigned_gpu
-
-        self.device = bind_assigned_gpu(config.tp_info.rank)
-        _adjust_config(config)
+        self.device = _prepare_cuda_device(config)
         from freetoken.utils import is_sm75_device
 
         if is_sm75_device(self.device):
@@ -1345,7 +1358,13 @@ def _ensure_expandable_segments() -> None:
     if os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF"):
         return
     try:
-        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        # PyTorch 2.12 deprecated the cuda.memory wrapper in favor of the
+        # accelerator-level entry point. Keep the fallback for older supported
+        # development environments; those builds do not emit the 2.12 warning.
+        setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+        if setter is None:
+            setter = torch.cuda.memory._set_allocator_settings
+        setter("expandable_segments:True")
     except Exception as exc:  # pragma: no cover - depends on torch build
         logger.info_rank0(f"Could not enable expandable_segments ({exc}); continuing")
         return
