@@ -38,3 +38,68 @@ for them; other checkpoints of the same architectures work too.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
 - Multimodal checkpoints are served text-only.
+
+## DeepSeek-V4 on multiple GPUs
+
+For DeepSeek-V4 FP4, tensor parallelism keeps every expert id routable on every
+rank but shards each expert's SwiGLU intermediate dimension. A TP=4 process
+therefore holds one quarter of every host expert bank and one quarter of every
+GPU expert slot; the partial routed outputs are summed across the four GPUs.
+
+The offload cache also has a GPU-only tier. Complete expert layers assigned to
+that tier are copied into protected cache slots as soon as the layer finishes
+loading, then their anonymous host pages are discarded. With `R` resident
+layers, aggregate expert host backing is approximately:
+
+```
+(num_moe_layers - R) * num_experts * unsharded_expert_bytes
+```
+
+At the published V4-Flash geometry (`43` layers, `256` experts, expert
+intermediate size `2048`), TP=4 uses 0.796875 GiB per complete expert layer on
+each GPU. Every layer moved to the GPU-only tier removes 3.1875 GiB of aggregate
+host backing; keeping all layers host-backed would require about 137.06 GiB for
+the routed experts alone.
+
+`--moe-gpu-only-layers auto` is the default. It uses every complete layer that
+fits after reserving one dynamic layer, or two while prefill-copy overlap is
+enabled. `--moe-gpu-only-layers N` makes the requested count strict, and `0`
+keeps the traditional all-host-backed layout.
+
+For a low-concurrency TP=4 deployment, an explicit layout can be selected with:
+
+```bash
+ft serve \
+  --model /data/models/DeepSeek-V4-Flash-0731 \
+  --tp-size 4 \
+  --moe-backend offload \
+  --nvfp4-backend triton \
+  --moe-cache-size 4352 \
+  --moe-gpu-only-layers auto \
+  --expert-load serial \
+  --disable-moe-prefill-overlap \
+  --max-running-requests 1 \
+  --cuda-graph-max-bs 0 \
+  --max-seq-len-override 512 \
+  --num-tokens 1536 \
+  --max-prefill-length 128 \
+  --memory-ratio 1.0
+```
+
+This allocates 17 layer-equivalents of cache: one remains dynamic and 16 complete
+layers (27 through 42) become GPU-only. It releases 51.00 GiB of aggregate host
+pages and retains about 86.06 GiB of routed-expert backing. Treat this as a
+capacity example rather than a portable preset: reduce the cache or token budget
+on smaller GPUs, and add resident layers only when both the VRAM budget and one
+dynamic layer still fit.
+
+`--disable-moe-prefill-overlap` trades prefill H2D/GEMM overlap for one fewer
+dynamic layer buffer, making one additional complete layer eligible for the
+GPU-only tier. `--moe-cache-auto` remains useful when VRAM is the only
+constraint, but it does not infer how much host RAM the checkpoint needs; use
+an explicit cache size when GPU residency is required to make the model fit in
+host memory.
+
+Multi-GPU DSV4 currently requires the original safetensors checkpoint. Existing
+FTW expert banks contain a TP=1 physical layout, so the server rejects them for
+TP>1 instead of silently duplicating experts and over-summing their outputs.

@@ -39,11 +39,17 @@ _BLK = 4096  # O_DIRECT alignment (page size)
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
-    Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths; LOCKED (mlock'd, no device address) and PAGEABLE layers must decode on the CPU executor.
-    The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
+    ``PINNED`` (cudaHostRegister'd) is required for anything the GPU dereferences:
+    the decode gather kernels and asynchronous prefill copies. ``GPU_ONLY`` means the
+    layer was copied into protected GPU-cache slots while loading and its anonymous
+    host pages were discarded afterwards. ``LOCKED`` (VirtualLock / mlock:
+    resident for the CPU executor, but with no device address) and ``PAGEABLE``
+    serve hosts that cap CUDA pin quota (WSL/WDDM: roughly half of RAM); those
+    layers decode on CPU and use synchronous pageable copies for prefill.
     """
 
     PINNED = "pinned"
+    GPU_ONLY = "gpu_only"
     LOCKED = "locked"
     PAGEABLE = "pageable"
 
@@ -105,7 +111,16 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         else:
-            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+            # ``mmap(-1, size)`` defaults to MAP_SHARED on Unix. Shared anonymous
+            # pages live in shmem and MADV_DONTNEED does not reliably reclaim them,
+            # which defeats GPU-only residency. These banks are never shared across
+            # processes, so use a private mapping whose dirty pages can be discarded.
+            self._buf = mmap.mmap(
+                -1,
+                asize,
+                flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
@@ -346,6 +361,50 @@ class PinPipeline:
         self.wait()
 
 
+class ServingLayerPipeline:
+    """Mixed serving sink for pinned and GPU-only expert layers.
+
+    Loaders call this once all banks of a layer have been filled. Pinned layers
+    enter the ordinary asynchronous :class:`PinPipeline`. GPU-only layers are
+    handed to ``gpu_sink`` as ``{name: tensor}``; once that callback returns, the
+    now-redundant anonymous host pages are discarded with ``MADV_DONTNEED``.
+
+    ``gpu_sink`` must not retain or asynchronously read the host tensors after it
+    returns. The offload cache's sink performs a blocking H2D copy for precisely
+    this reason.
+    """
+
+    def __init__(self, residency: list[str], gpu_sink) -> None:
+        self._residency = list(residency)
+        self._gpu_sink = gpu_sink
+        self._pins: PinPipeline | None = None
+
+    def __enter__(self) -> "ServingLayerPipeline":
+        self._pins = PinPipeline()
+        return self
+
+    def __call__(self, layer_id: int, banks: dict[str, HostBank]) -> None:
+        assert self._pins is not None, "ServingLayerPipeline used outside its context"
+        plan = _requested_residency
+        label = self._residency[layer_id]
+        if plan is not None:
+            label = plan.residency_for(layer_id)
+        residence = HostResidency(label)
+        if residence is not HostResidency.GPU_ONLY:
+            for bank in banks.values():
+                self._pins.submit(bank, residence.value, plan, layer_id)
+            return
+        if self._gpu_sink is None:
+            raise RuntimeError(f"GPU-only expert layer {layer_id} has no GPU sink")
+        self._gpu_sink(layer_id, {name: bank.tensor for name, bank in banks.items()})
+        for bank in banks.values():
+            bank.release()
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        assert self._pins is not None
+        self._pins.__exit__(exc_type, exc, tb)
+
+
 class LayerCompletionTracker:
     """Fire a sink once per layer, when all of that layer's writes have landed.
 
@@ -413,6 +472,7 @@ def read_file_into(buf: memoryview | mmap.mmap, path: str, *, workers: int = 8,
 __all__ = [
     "HostBank",
     "HostResidency",
+    "ServingLayerPipeline",
     "LayerCompletionTracker",
     "PinPipeline",
     "alloc_banks",

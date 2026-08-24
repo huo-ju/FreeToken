@@ -43,7 +43,9 @@ class ExpertBanks:
     # marlin/b12x per-expert global scales ([L*E]); None for formats without them
     gate_up_alpha: torch.Tensor | None = field(default=None)
     down_alpha: torch.Tensor | None = field(default=None)
-    # per-layer HostResidency values actually applied by the loader; None -> all pinned (also the degrade signal when a request was not honored)
+    # Per-layer HostResidency values actually applied by the loader; None means
+    # all pinned (and is also the degrade signal when a request was not honored).
+    # DSV4 may label layers gpu_only after staging them into protected cache slots.
     layer_residency: list[str] | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
@@ -252,7 +254,20 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
-def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _dsfp4_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel=False,
+    workers=8,
+    chunk=_PARALLEL_CHUNK,
+    decode_target="gpu",
+    layer_sink=None,
+    layer_residency=None,
+    gpu_sink=None,
+) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
     # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
@@ -262,20 +277,42 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     if dummy:
         from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
 
-        banks = dummy_dsfp4_expert_sources(args)
+        banks = dummy_dsfp4_expert_sources(
+            args, layer_residency=layer_residency, gpu_sink=gpu_sink
+        )
     elif parallel:  # parallel: common chunked multi-threaded O_DIRECT reader
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources_parallel
 
         banks = load_dsfp4_expert_sources_parallel(
-            model_path, args, workers=workers, chunk=chunk, layer_sink=sink
+            model_path, args, workers=workers, chunk=chunk, layer_sink=sink,
+            layer_residency=layer_residency, gpu_sink=gpu_sink,
         )
     else:
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
 
-        banks = load_dsfp4_expert_sources(model_path, args, layer_sink=sink)
+        banks = load_dsfp4_expert_sources(
+            model_path, args, layer_sink=sink,
+            layer_residency=layer_residency, gpu_sink=gpu_sink,
+        )
     return ExpertBanks(
-        "ds_fp4", {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]}, streamed=sink is not None
+        "ds_fp4",
+        {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]},
+        streamed=sink is not None,
     )
+
+
+def expert_bank_specs(model_config) -> dict[str, tuple[tuple[int, ...], torch.dtype]] | None:
+    """Return allocation-only per-rank bank specs when a provider exposes them.
+
+    This lets the engine size and allocate the GPU cache *before* materializing
+    host banks, which is required for streaming GPU-only layers. Formats without
+    such a contract keep the existing load-first path.
+    """
+    if getattr(model_config, "expert_quant", None) == "ds_fp4":
+        from freetoken.models.deepseek_v4.weight import dsfp4_expert_bank_specs
+
+        return dsfp4_expert_bank_specs(model_config.dsv4_args)
+    return None
 
 
 def _model_setup_override(model_config):
@@ -304,7 +341,20 @@ _PROVIDERS = {
 }
 
 
-def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _build_expert_banks(
+    model_path,
+    model_config,
+    device,
+    dtype,
+    dummy,
+    parallel,
+    workers,
+    chunk,
+    decode_target="gpu",
+    layer_sink=None,
+    layer_residency=None,
+    gpu_sink=None,
+) -> ExpertBanks:
     """Dispatch to the model's setup-override or the per-quant provider. ``parallel=True``
     is the parallel read; a provider that hasn't implemented it raises NotImplementedError (the
     caller falls back to serial). ``decode_target`` lets the cpu backend force CPU-readable
@@ -338,11 +388,19 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             f"no expert-bank provider for expert_quant={expert_quant!r} "
             f"(known: {sorted(_PROVIDERS)})"
         )
-    return _PROVIDERS[expert_quant](
-        model_path, model_config, device, dtype, dummy,
+    kw = dict(
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
         layer_sink=layer_sink,
     )
+    gpu_only_requested = bool(layer_residency and "gpu_only" in layer_residency)
+    if gpu_sink is not None or gpu_only_requested:
+        if expert_quant != "ds_fp4":
+            raise NotImplementedError(
+                f"GPU-only expert layers are not implemented for {expert_quant!r} banks"
+            )
+    if expert_quant == "ds_fp4" and (layer_residency is not None or gpu_sink is not None):
+        kw.update(layer_residency=layer_residency, gpu_sink=gpu_sink)
+    return _PROVIDERS[expert_quant](model_path, model_config, device, dtype, dummy, **kw)
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -418,6 +476,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    gpu_sink=None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -442,6 +501,11 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if gpu_sink is not None or (layer_residency and "gpu_only" in layer_residency):
+            raise NotImplementedError(
+                "GPU-only expert streaming from an FTW checkpoint is not implemented yet; "
+                "serve from the original DeepSeek-V4 safetensors checkpoint"
+            )
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,
@@ -482,14 +546,18 @@ def load_expert_banks(
 
     with requested_residency(layer_residency) as residency_plan:
         try:
-            banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                        decode_target, layer_sink)
+            banks = _build_expert_banks(
+                model_path, model_config, device, dtype, dummy, parallel, workers,
+                chunk, decode_target, layer_sink, layer_residency, gpu_sink,
+            )
         except NotImplementedError as exc:
             if not parallel:
                 raise
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
-            banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                        decode_target, layer_sink)
+            banks = _build_expert_banks(
+                model_path, model_config, device, dtype, dummy, False, workers,
+                chunk, decode_target, layer_sink, layer_residency, gpu_sink,
+            )
     return _echo_residency(banks, layer_residency, residency_plan)
 
 

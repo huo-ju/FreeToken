@@ -303,6 +303,18 @@ class OffloadMoELayer(MoELayer):
         ids), so no ``ensure_experts``/``copy_missing`` here."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.is_gpu_resident_layer(self.layer_id):
+            cache.map_gpu_resident_experts(self.layer_id, topk_ids)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
@@ -383,6 +395,24 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        if cache.is_gpu_resident_layer(self.layer_id):
+            # Keep the next host-backed layer's transfer overlapped with this
+            # resident layer's grouped GEMM. A resident layer itself needs no
+            # prefill buffer: its permanent range is already expert-ordered.
+            if cache.prefill_overlap:
+                if self.layer_id == 0:
+                    cache.begin_prefill()
+                cache.prefetch_prefill_layer(self.layer_id + 1)
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.gpu_resident_views(self.layer_id),
+                n=self.num_experts,
+                alphas=cache.alphas_for_layer(self.layer_id),
+                is_prefill=True,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(

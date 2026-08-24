@@ -168,6 +168,22 @@ def test_adjust_config_allows_auto_for_dsv4():
     assert cfg.page_size == 128  # DSV4's KV page is the P-token window page
 
 
+def test_adjust_config_rejects_tp_dsv4_ftw_layout(tmp_path):
+    from types import SimpleNamespace
+
+    from freetoken.checkpoint.ftw import INDEX_NAME
+    from freetoken.engine.engine import _adjust_config
+
+    (tmp_path / INDEX_NAME).write_text("{}")
+    cfg = _dsv4_adjust_cfg(
+        tp_info=SimpleNamespace(size=4),
+        model_path=str(tmp_path),
+        use_dummy_weight=False,
+    )
+    with pytest.raises(ValueError, match="original safetensors"):
+        _adjust_config(cfg)
+
+
 def test_adjust_config_resolves_num_tokens_for_dsv4():
     # --num-tokens resolves AFTER every page_size override, so DSV4's P=128 page divides it.
     from freetoken.engine.engine import _adjust_config
@@ -329,6 +345,18 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         kv_reserve_tokens=0, page_size=16, quant_format="bf16",
     )
     assert (size, pages, overlap) == expected
+
+    # Allocation-only specs must produce the identical plan. DSV4 uses this
+    # path before host banks exist so GPU-only layers can stream directly into
+    # their final cache ranges.
+    specs = {
+        "gate_up": ((4, 32, 8), torch.float16),
+        "down": ((4, 8, 16), torch.float16),
+    }
+    from_specs = engine._resolve_auto_moe_cache_size(
+        StubConfig(), bank_specs=specs, quant_format="bf16"
+    )
+    assert from_specs == expected
 
 
 # ---------------------------------------------------------------------------

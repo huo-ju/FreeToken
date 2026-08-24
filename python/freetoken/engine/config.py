@@ -33,6 +33,11 @@ class EngineConfig:
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
+    # Whole expert layers kept exclusively in protected GPU cache slots. Their
+    # host pages are discarded during loading. -1 = use as many complete layers
+    # as fit while retaining the dynamic-cache/prefill floor; 0 = disabled;
+    # positive = require exactly that many. Currently implemented for DSV4 ds_fp4.
+    moe_gpu_only_layers: int = -1
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
