@@ -28,13 +28,13 @@ import triton.language as tl
 
 from freetoken.kernel.triton.autotune_cache import autotune_cache_kwargs
 
-_NUM_SM = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
 _MIN_CHUNK = 4096  # do not split a row finer than this
 
 
-def _plan(B, V):
+def _plan(B, V, device):
     """Return (G, CHUNK): split each row into G column-chunks of size CHUNK."""
-    g_by_sm = max(1, _NUM_SM // B)
+    num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    g_by_sm = max(1, num_sm // B)
     g_by_chunk = max(1, triton.cdiv(V, _MIN_CHUNK))
     G = min(g_by_sm, g_by_chunk)
     CHUNK = triton.cdiv(V, G)
@@ -124,7 +124,7 @@ def softmax(logits, temperature=None, enable_pdl=None):
     logits = logits.float()
     B, V = logits.shape
     probs = torch.empty_like(logits)
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, logits.device)
     if temperature is None:
         temperature = 1.0
     if isinstance(temperature, torch.Tensor):
@@ -296,7 +296,7 @@ def _search(probs, target, mass, R, BINS):
     """Return per-row threshold: keep x >= thr, with count/mass(>=thr) ~ target."""
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, dev)
     grid = (B * G,)
     rmax = torch.zeros(B, device=dev, dtype=torch.float32)
     _rmax_pass[grid](probs, rmax, V, G, CHUNK, probs.stride(0), BLOCK_SIZE=2048, num_warps=8)
@@ -316,7 +316,7 @@ def _search(probs, target, mass, R, BINS):
 def _renorm(probs, thr):
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, dev)
     grid = (B * G,)
     out = torch.empty_like(probs)
     ksum = torch.zeros(B, device=dev, dtype=torch.float32)
@@ -412,7 +412,7 @@ def _gen_u(B, device, seed, offset):
 def _draw(probs, thr, seed, offset):
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, dev)
     grid = (B * G,)
     psum = torch.empty(B * G, device=dev, dtype=torch.float32)
     choff = torch.empty(B * G, device=dev, dtype=torch.float32)
@@ -559,7 +559,7 @@ def _topk_thr_ksum(probs, top_k):
     """Return (threshold[B], kept_sum[B]) for a top-k keep: x >= threshold."""
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, dev)
     grid = (B * G,)
     target = _topk_target(top_k, B, dev)
     rmax = torch.zeros(B, device=dev, dtype=torch.float32)
@@ -577,7 +577,7 @@ def top_k_renorm_probs(probs, top_k):
     probs = probs.float()
     B, V = probs.shape
     dev = probs.device
-    G, CHUNK = _plan(B, V)
+    G, CHUNK = _plan(B, V, dev)
     grid = (B * G,)
     thr, ksum = _topk_thr_ksum(probs, top_k)
     out = torch.empty_like(probs)

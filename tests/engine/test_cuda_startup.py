@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -64,3 +66,32 @@ def test_expandable_segments_prefers_accelerator_api(monkeypatch):
     engine._ensure_expandable_segments()
 
     assert calls == ["expandable_segments:True"]
+
+
+def test_triton_sampling_import_does_not_probe_cuda(monkeypatch):
+    """Importing a worker-side kernel module must not create a default-GPU context."""
+    module_name = "freetoken.kernel.triton.sampling"
+    sys.modules.pop(module_name, None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("sampling queried CUDA during import")
+        ),
+    )
+
+    importlib.import_module(module_name)
+
+
+def test_triton_sampling_plan_probes_tensor_device(monkeypatch):
+    sampling = importlib.import_module("freetoken.kernel.triton.sampling")
+    seen: list[torch.device] = []
+
+    def properties(device):
+        seen.append(device)
+        return SimpleNamespace(multi_processor_count=80)
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+
+    assert sampling._plan(2, 32768, torch.device("cuda:3")) == (8, 4096)
+    assert seen == [torch.device("cuda:3")]
