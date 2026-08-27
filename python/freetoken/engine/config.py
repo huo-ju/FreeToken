@@ -21,6 +21,12 @@ class EngineConfig:
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"
+    # Experimental unified-plan policy. Compatibility preserves the legacy
+    # offload/cpu/hybrid meanings; forced policies are correctness/perf baselines.
+    moe_execution_policy: str = "compatibility"
+    # Startup-only routed-expert TP widths: "equal" or a comma-separated list
+    # such as "512,512,768,256". Shared experts remain equal TP.
+    moe_tp_layout: str = "equal"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered

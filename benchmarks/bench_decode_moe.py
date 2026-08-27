@@ -47,8 +47,10 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import signal
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -85,12 +87,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"local jsonl instead of downloading {AIME_REPO}; default $FREETOKEN_AIME25_JSONL",
     )
     p.add_argument("--problem", type=int, default=0, help="0-based AIME problem index")
+    p.add_argument(
+        "--eval-plan",
+        default=None,
+        help="JSON test plan containing warmup/prefill/decode/quality cases instead of AIME",
+    )
+    p.add_argument(
+        "--case-id",
+        default="decode_64_r0",
+        help="case id selected from --eval-plan",
+    )
     p.add_argument("--decode", type=int, default=256, help="decode tokens to measure (D)")
+    p.add_argument("--tp-size", type=int, default=1, help="tensor-parallel server ranks")
+    p.add_argument(
+        "--execution-policy",
+        choices=("compatibility", "force_equal_tp", "force_weighted_tp"),
+        default="compatibility",
+        help="experimental startup-fixed MoE execution policy",
+    )
+    p.add_argument(
+        "--moe-tp-layout",
+        default="equal",
+        help="routed intermediate widths in TP-rank order, or equal",
+    )
+    p.add_argument(
+        "--repetitions", type=int, default=3,
+        help="steady-state measured requests per server (default: 3)",
+    )
     p.add_argument(
         "--cache",
         type=int,
         default=0,
         help="GPU expert cache slots; 0 = auto-size from free VRAM",
+    )
+    p.add_argument(
+        "--cache-sequence",
+        type=int,
+        nargs="+",
+        default=None,
+        help="measure several cache sizes in one server using safe runtime rebuilds",
     )
     p.add_argument("--cache-rate", type=float, default=None, help="cache slots as a fraction of L*E")
     p.add_argument(
@@ -100,9 +135,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="hybrid: max PCIe fetches/layer; -1 = auto (benched pcie/cpu bandwidth fraction)",
     )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
-    p.add_argument("--gpu", default=None,
-                   help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)")
+    p.add_argument(
+        "--gpu",
+        default=None,
+        help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)",
+    )
+    p.add_argument(
+        "--num-tokens", type=int, default=None,
+        help="fixed KV capacity in tokens (passed as --num-tokens)",
+    )
+    p.add_argument(
+        "--expert-load", choices=("auto", "serial", "parallel"), default="auto",
+        help="expert-bank checkpoint loading mode passed to the server",
+    )
     p.add_argument("--no-graph", action="store_true", help="eager decode instead of CUDA graph")
+    p.add_argument(
+        "--no-prefill-overlap", action="store_true",
+        help="disable the MoE prefill copy double buffer",
+    )
     p.add_argument(
         "--greedy",
         action="store_true",
@@ -114,15 +164,69 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=1800,
         help="seconds to wait for the spawned server to become ready",
     )
+    p.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=86400,
+        help="seconds TP collectives may wait during asymmetric model loading (default: 24h)",
+    )
     p.add_argument("--json", dest="json_out", default=None, help="append the result rows here")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.tp_size < 1 or args.repetitions < 1:
+        p.error("--tp-size and --repetitions must be positive")
+    if args.distributed_timeout <= 0:
+        p.error("--distributed-timeout must be positive")
+    backends = tuple(value.strip() for value in args.backend.split(","))
+    if args.execution_policy == "force_weighted_tp":
+        if args.moe_tp_layout == "equal":
+            p.error("force_weighted_tp requires an explicit --moe-tp-layout")
+        if any(backend != "offload" for backend in backends):
+            p.error("force_weighted_tp benchmark rows require --backend offload")
+    elif args.moe_tp_layout != "equal":
+        p.error("an explicit --moe-tp-layout requires force_weighted_tp")
+    if args.execution_policy == "force_equal_tp" and any(
+        backend != "offload" for backend in backends
+    ):
+        p.error("force_equal_tp benchmark rows require --backend offload")
+    if args.cache_sequence is not None:
+        if any(size <= 0 for size in args.cache_sequence):
+            p.error("--cache-sequence values must be positive")
+        if args.cache > 0 or args.cache_rate is not None:
+            p.error("--cache-sequence cannot be combined with --cache or --cache-rate")
+        if args.tp_size > 1 and len(args.cache_sequence) > 1:
+            p.error(
+                "runtime cache rebuild is unsupported under TP > 1; run one "
+                "--cache value per benchmark invocation"
+            )
+    if args.num_tokens is not None and args.num_tokens <= 0:
+        p.error("--num-tokens must be positive")
+    return args
 
 
-def load_problem(path: str | None, index: int) -> tuple[str, str]:
+def load_problem(
+    path: str | None,
+    index: int,
+    *,
+    eval_plan: str | None = None,
+    case_id: str = "decode_64_r0",
+) -> tuple[str, str]:
     """One AIME-25 (problem, answer). Downloads the dataset unless ``path`` overrides it.
 
     Accepts both the Hub schema (``problem``) and the pre-formatted jsonl some local copies
     use (``prompt``, answer instruction already appended)."""
+    if eval_plan is not None:
+        plan = json.loads(Path(eval_plan).read_text())
+        cases = []
+        for section in ("warmup", "decode_warmup", "prefill", "decode", "quality"):
+            value = plan.get(section, [])
+            cases.extend(value if isinstance(value, list) else [value])
+        matches = [case for case in cases if isinstance(case, dict) and case.get("id") == case_id]
+        if len(matches) != 1:
+            sys.exit(
+                f"--case-id {case_id!r} matched {len(matches)} cases in {eval_plan}; expected one"
+            )
+        case = matches[0]
+        return case["prompt"], str(case.get("expected", ""))
     if not path:
         from huggingface_hub import hf_hub_download
 
@@ -167,6 +271,28 @@ def get_json(url: str, timeout: float = 10) -> dict:
         return json.load(resp)
 
 
+def post_json(url: str, payload: dict, timeout: float = 300) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        # Cache rebuild intentionally uses non-2xx responses for recoverable
+        # rejections. Preserve the JSON reason instead of replacing it with the
+        # unhelpful generic ``HTTP Error 503`` exception.
+        try:
+            detail = json.loads(error.read())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            detail = {"error": str(error)}
+        raise RuntimeError(
+            f"POST {url} failed with HTTP {error.code}: {detail}"
+        ) from error
+
+
 def free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -179,21 +305,150 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
         "--model", args.model,
         "--host", "127.0.0.1", "--port", str(port),
         "--moe-backend", backend,
+        "--moe-execution-policy", args.execution_policy,
+        "--moe-tp-layout", args.moe_tp_layout,
+        "--tp-size", str(args.tp_size),
+        "--distributed-timeout", str(args.distributed_timeout),
         "--max-running-requests", "1",
         "--max-seq-len-override", str(8192 + args.decode),
         "--memory-ratio", str(args.mem_ratio),
+        "--expert-load", args.expert_load,
         "--cuda-graph-max-bs", "0" if args.no_graph else "1",
         "--moe-hybrid-max-fetch", str(args.hybrid_fetch),
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
-    if args.cache > 0:
+    if args.no_prefill_overlap:
+        cmd.append("--disable-moe-prefill-overlap")
+    if args.num_tokens is not None:
+        cmd += ["--num-tokens", str(args.num_tokens)]
+    if args.cache_sequence is not None:
+        cmd += ["--moe-cache-size", str(args.cache_sequence[0])]
+    elif args.cache > 0:
         cmd += ["--moe-cache-size", str(args.cache)]
     elif args.cache_rate is not None:
         cmd += ["--moe-cache-rate", str(args.cache_rate)]
     else:
         cmd.append("--moe-cache-auto")
     return cmd
+
+
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def _meminfo() -> dict[str, int]:
+    result: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, value = line.split(":", 1)
+            if key in {"MemAvailable", "Mlocked", "SwapFree"}:
+                result[f"{key.lower()}_bytes"] = int(value.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return result
+
+
+def _gpu_topology() -> list[dict]:
+    """Best-effort rank identity without importing torch into the client harness."""
+    fields = (
+        "index,name,pci.bus_id,pcie.link.gen.current,pcie.link.width.current,"
+        "memory.total,driver_version"
+    )
+    try:
+        raw = subprocess.check_output(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible_order = None if not visible else [value.strip() for value in visible.split(",")]
+    selected = None if visible_order is None else set(visible_order)
+    rows = []
+    for line in raw.splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if len(values) != 7 or (selected is not None and values[0] not in selected):
+            continue
+        bdf_parts = values[2].lower().split(":")
+        bdf = (
+            f"{bdf_parts[-3][-4:]}:{bdf_parts[-2]}:{bdf_parts[-1]}"
+            if len(bdf_parts) >= 3 else values[2].lower()
+        )
+        numa_path = Path("/sys/bus/pci/devices") / bdf / "numa_node"
+        try:
+            numa = int(numa_path.read_text().strip())
+        except (OSError, ValueError):
+            numa = -1
+        rows.append({
+            "rank": (
+                visible_order.index(values[0]) if visible_order is not None else int(values[0])
+            ),
+            "index": int(values[0]), "name": values[1], "pci_bdf": bdf,
+            "pcie_generation": int(values[3]), "pcie_width": int(values[4]),
+            "memory_total_mib": int(values[5]), "driver_version": values[6],
+            "numa_node": numa,
+        })
+    return sorted(rows, key=lambda row: row["rank"])
+
+
+class ResourceMonitor:
+    """Low-frequency host/link sampler for startup and request peak accounting."""
+
+    def __init__(self, interval_s: float = 1.0):
+        self.interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.samples = 0
+        self.min_mem_available = 2**63 - 1
+        self.max_mlocked = 0
+        self.min_swap_free = 2**63 - 1
+        self.gpus: dict[int, dict] = {}
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            host = _meminfo()
+            self.min_mem_available = min(
+                self.min_mem_available, host.get("memavailable_bytes", self.min_mem_available)
+            )
+            self.max_mlocked = max(self.max_mlocked, host.get("mlocked_bytes", 0))
+            self.min_swap_free = min(
+                self.min_swap_free, host.get("swapfree_bytes", self.min_swap_free)
+            )
+            for gpu in _gpu_topology():
+                peak = self.gpus.setdefault(gpu["rank"], dict(gpu))
+                peak["pcie_generation"] = max(
+                    peak.get("pcie_generation", 0), gpu["pcie_generation"]
+                )
+                peak["pcie_width"] = max(peak.get("pcie_width", 0), gpu["pcie_width"])
+            self.samples += 1
+            self._stop.wait(self.interval_s)
+
+    def stop(self) -> dict:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, self.interval_s * 2))
+        return {
+            "samples": self.samples,
+            "min_mem_available_bytes": (
+                None if self.min_mem_available == 2**63 - 1 else self.min_mem_available
+            ),
+            "max_mlocked_bytes": self.max_mlocked,
+            "min_swap_free_bytes": (
+                None if self.min_swap_free == 2**63 - 1 else self.min_swap_free
+            ),
+            "gpu_topology_peak_link": [self.gpus[rank] for rank in sorted(self.gpus)],
+        }
 
 
 def die_with_log(msg: str, log_path: str) -> None:
@@ -301,17 +556,137 @@ def stream_generate(origin: str, model_id: str, problem: str, sampling: dict,
     return {"t0": t0, "stamps": stamps, "text": "".join(pieces), "usage": usage}
 
 
-def run_one(args: argparse.Namespace, backend: str) -> dict:
-    problem, answer = load_problem(args.aime, args.problem)
+def _summarize_measurements(
+    *,
+    args: argparse.Namespace,
+    backend: str,
+    problem: str,
+    measured: list[dict],
+    stats: dict,
+    cache_status: dict,
+    cache_size: int | None,
+    command: list[str],
+    topology: list[dict],
+    host_before: dict,
+    host_after: dict,
+    resource_summary: dict,
+    server_log: str,
+) -> dict:
+    runs = []
+    for repetition, result in enumerate(measured):
+        stamps, usage = result["stamps"], result["usage"]
+        if len(stamps) < 2:
+            raise RuntimeError(f"need >=2 token events to measure decode, got {len(stamps)}")
+        completion = usage["completion_tokens"]
+        if completion != args.decode:
+            print(
+                f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}",
+                flush=True,
+            )
+        steps = completion - 1
+        decode_time = stamps[-1] - stamps[0]
+        gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
+        runs.append({
+            "repetition": repetition,
+            "decode_steps": steps,
+            "decode_time_s": decode_time,
+            "decode_tok_s": steps / decode_time if decode_time > 0 else 0.0,
+            "ms_per_token": decode_time / steps * 1e3 if steps > 0 else 0.0,
+            "event_ms_p50": gaps[len(gaps) // 2],
+            "event_ms_p99": gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))],
+            "ttft_ms": (stamps[0] - result["t0"]) * 1e3,
+            "events": len(stamps),
+            "completion_tokens": completion,
+            "output_sha1": hashlib.sha1(result["text"].encode()).hexdigest()[:12],
+        })
+    result = measured[-1]
+    usage = result["usage"]
+
+    def median(field: str) -> float:
+        return statistics.median(run[field] for run in runs)
+
+    row = {
+        "schema": "freetoken.moe-server-benchmark",
+        "version": 1,
+        "commit": _git_commit(),
+        "command": shlex.join(command),
+        "model": args.model,
+        "backend": backend,
+        "tp_size": args.tp_size,
+        "moe_cache_size": cache_size,
+        "kv_token_override": args.num_tokens,
+        "problem": args.problem,
+        "eval_case_id": args.case_id if args.eval_plan else None,
+        "prompt_sha256": hashlib.sha256(problem.encode()).hexdigest(),
+        "prompt_tokens": usage["prompt_tokens"],
+        "decode_steps": runs[-1]["decode_steps"],
+        "decode_tok_s": median("decode_tok_s"),
+        "ms_per_token": median("ms_per_token"),
+        "event_ms_p50": median("event_ms_p50"),
+        "event_ms_p99": median("event_ms_p99"),
+        "ttft_ms": median("ttft_ms"),
+        "events": runs[-1]["events"],
+        "completion_tokens": runs[-1]["completion_tokens"],
+        "vram_gib": stats.get("vram_bytes", 0) / 2**30,
+        "cuda_graph": not args.no_graph,
+        "prefill_overlap": not args.no_prefill_overlap,
+        "cache_initial_state": "one warm-up request after startup/rebuild",
+        "cache_status": cache_status,
+        "gpu_topology": topology,
+        "host_memory_before": host_before,
+        "host_memory_after": host_after,
+        "resource_summary": resource_summary,
+        "swap_delta_bytes": (
+            host_before.get("swapfree_bytes", 0) - host_after.get("swapfree_bytes", 0)
+        ),
+        "sampling": resolve_sampling(args.model, args.greedy)[0],
+        "output_sha1": hashlib.sha1(result["text"].encode()).hexdigest()[:12],
+        "runs": runs,
+        "server_log": server_log,
+    }
+
+    print(
+        f"\n==== decode bs=1 [{backend}] cache={cache_size} via /v1/chat/completions ====",
+        flush=True,
+    )
+    print(
+        f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  "
+        f"({row['ms_per_token']:.3f} ms/token)"
+    )
+    print(f"  TTFT (warm)       : {row['ttft_ms']:8.1f} ms  (prompt {row['prompt_tokens']} tok)")
+    spread = max(run["decode_tok_s"] for run in runs) - min(
+        run["decode_tok_s"] for run in runs
+    )
+    print(
+        f"  decode measured   : {len(runs)} x {row['decode_steps']} steps; "
+        f"event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms"
+    )
+    print(f"  repetition spread : {spread:.3f} tok/s (max - min)")
+    print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
+    sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
+    print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
+    print(f"  output sample     : {result['text'][:240]!r}")
+    return row
+
+
+def run_one(args: argparse.Namespace, backend: str) -> list[dict]:
+    problem, answer = load_problem(
+        args.aime, args.problem, eval_plan=args.eval_plan, case_id=args.case_id
+    )
     sampling, sampling_src = resolve_sampling(args.model, args.greedy)
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
     fd, log_path = tempfile.mkstemp(prefix=f"bench-serve-{backend}-", suffix=".log")
     cmd = serve_cmd(args, backend, port)
+    host_before = _meminfo()
+    topology = _gpu_topology()
+    resource_monitor = ResourceMonitor()
+    resource_monitor.start()
 
     print(
         f"[bench] model={args.model}\n"
-        f"[bench] backend={backend} cache={args.cache or args.cache_rate or 'auto'} "
+        f"[bench] backend={backend} "
+        f"cache={args.cache_sequence or args.cache or args.cache_rate or 'auto'} "
         f"mem_ratio={args.mem_ratio} decode={args.decode} graph={not args.no_graph}\n"
         f"[bench] sampling={sampling} <- {sampling_src}\n"
         f"[bench] server log: {log_path}",
@@ -328,55 +703,55 @@ def run_one(args: argparse.Namespace, backend: str) -> dict:
             wait_ready(origin, proc, log_path, args.server_timeout)
             model_id = get_json(f"{origin}/v1/models")["data"][0]["id"]
             print(f"[bench] model_id={model_id}", flush=True)
-            print(f"[bench] AIME25 #{args.problem} (answer {answer})", flush=True)
+            label = f"eval case {args.case_id}" if args.eval_plan else f"AIME25 #{args.problem}"
+            print(f"[bench] {label} (answer {answer})", flush=True)
 
-            # Warm the expert cache to a steady-state decode working set.
-            stream_generate(origin, model_id, problem, sampling, args)
-            r = stream_generate(origin, model_id, problem, sampling, args)
-            stats = get_json(f"{origin}/v1/stats")
+            cache_sizes = args.cache_sequence or [args.cache if args.cache > 0 else None]
+            measurement_sets = []
+            for index, cache_size in enumerate(cache_sizes):
+                if index:
+                    rebuild = post_json(
+                        f"{origin}/v1/cache/rebuild",
+                        {"moe_cache_size": cache_size, "mode": "if_idle", "timeout": 300},
+                        timeout=360,
+                    )
+                    if rebuild.get("status") != "ok":
+                        raise RuntimeError(f"cache rebuild to {cache_size} failed: {rebuild}")
+                # Re-establish a comparable warm state after startup or rebuild.
+                stream_generate(origin, model_id, problem, sampling, args)
+                measured = [
+                    stream_generate(origin, model_id, problem, sampling, args)
+                    for _ in range(args.repetitions)
+                ]
+                measurement_sets.append((
+                    cache_size,
+                    measured,
+                    get_json(f"{origin}/v1/stats"),
+                    get_json(f"{origin}/v1/cache/status"),
+                ))
         finally:
             stop_server(proc)
             pump.join(timeout=10)
-
-    stamps, usage = r["stamps"], r["usage"]
-    if len(stamps) < 2:
-        sys.exit(f"[bench] need >=2 token events to measure decode, got {len(stamps)}")
-    completion = usage["completion_tokens"]
-    if completion != args.decode:
-        print(f"[bench] WARNING: completion_tokens={completion} != --decode {args.decode}", flush=True)
-    steps = completion - 1
-    decode_time = stamps[-1] - stamps[0]
-    gaps = sorted((b - a) * 1e3 for a, b in zip(stamps, stamps[1:]))
-    row = {
-        "model": args.model,
-        "backend": backend,
-        "problem": args.problem,
-        "prompt_tokens": usage["prompt_tokens"],
-        "decode_steps": steps,
-        "decode_tok_s": steps / decode_time if decode_time > 0 else 0.0,
-        "ms_per_token": decode_time / steps * 1e3 if steps > 0 else 0.0,
-        "event_ms_p50": gaps[len(gaps) // 2],
-        "event_ms_p99": gaps[min(len(gaps) - 1, int(len(gaps) * 0.99))],
-        "ttft_ms": (stamps[0] - r["t0"]) * 1e3,
-        "events": len(stamps),
-        "completion_tokens": completion,
-        "vram_gib": stats.get("vram_bytes", 0) / 2**30,
-        "sampling": sampling,
-        "output_sha1": hashlib.sha1(r["text"].encode()).hexdigest()[:12],
-        "server_log": log_path,
-    }
-
-    print(f"\n==== decode bs=1 [{backend}] via /v1/chat/completions ====", flush=True)
-    print(f"  decode throughput : {row['decode_tok_s']:8.2f} tok/s  ({row['ms_per_token']:.3f} ms/token)")
-    print(f"  TTFT (warm)       : {row['ttft_ms']:8.1f} ms  (prompt {row['prompt_tokens']} tok)")
-    print(f"  decode measured   : {steps} steps in {decode_time:.3f} s  "
-          f"(event p50 {row['event_ms_p50']:.3f} / p99 {row['event_ms_p99']:.3f} ms, "
-          f"{len(stamps)} events)")
-    print(f"  vram (server)     : {row['vram_gib']:8.2f} GiB")
-    sha_note = "greedy" if args.greedy else "sampled, per-server deterministic"
-    print(f"  output sha1       : {row['output_sha1']}  ({sha_note}; compare across backends)")
-    print(f"  output sample     : {r['text'][:240]!r}")
-    return row
+            resource_summary = resource_monitor.stop()
+    host_after = _meminfo()
+    return [
+        _summarize_measurements(
+            args=args,
+            backend=backend,
+            problem=problem,
+            measured=measured,
+            stats=stats,
+            cache_status=cache_status,
+            cache_size=cache_size,
+            command=cmd,
+            topology=topology,
+            host_before=host_before,
+            host_after=host_after,
+            resource_summary=resource_summary,
+            server_log=log_path,
+        )
+        for cache_size, measured, stats, cache_status in measurement_sets
+    ]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -389,7 +764,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = []
     for backend in backends:
         try:
-            row = run_one(args, backend)
+            rows = run_one(args, backend)
         # SystemExit inherits BaseException, not Exception, so name both: a mid-decode
         # connection drop (server crash) must not abort the remaining backends either.
         except (SystemExit, Exception) as e:
@@ -400,7 +775,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if args.json_out:
             with open(args.json_out, "a") as f:
-                f.write(json.dumps(row) + "\n")
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
     if failed:
         print(f"\n[bench] backends that failed: {failed}", flush=True)
         return 1

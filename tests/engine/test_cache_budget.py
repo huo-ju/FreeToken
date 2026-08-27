@@ -126,7 +126,8 @@ def _dsv4_adjust_cfg(**over):
 
     model_config = SimpleNamespace(
         single_stream_only=False, dsv4_args=SimpleNamespace(window_size=128), is_moe=True,
-        expert_quant="ds_fp4", has_swa_attention=False, has_linear_attention=False,
+        expert_quant="ds_fp4", moe_intermediate_size=2048,
+        has_swa_attention=False, has_linear_attention=False,
     )
 
     class Cfg:
@@ -182,6 +183,20 @@ def test_adjust_config_rejects_tp_dsv4_ftw_layout(tmp_path):
     )
     with pytest.raises(ValueError, match="original safetensors"):
         _adjust_config(cfg)
+
+
+def test_adjust_config_resolves_weighted_dsv4_layout_once_at_startup():
+    from types import SimpleNamespace
+
+    from freetoken.engine.engine import _adjust_config
+
+    cfg = _dsv4_adjust_cfg(
+        tp_info=SimpleNamespace(rank=0, size=4),
+        moe_tp_layout="512,512,768,256",
+        use_dummy_weight=True,
+    )
+    _adjust_config(cfg)
+    assert cfg.model_config.routed_moe_tp_widths == (512, 512, 768, 256)
 
 
 def test_adjust_config_resolves_num_tokens_for_dsv4():

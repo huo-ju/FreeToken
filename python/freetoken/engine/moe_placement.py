@@ -8,9 +8,13 @@ be produced before any large expert allocation starts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable, Sequence
+
+from freetoken.moe.execution_plan import RoutedTpLayout
 
 
 class ExpertTier(str, Enum):
@@ -85,6 +89,82 @@ class MoePlacementPlan:
 
 class MoePlacementInfeasible(ValueError):
     """A pre-load capacity or provider-capability failure."""
+
+
+@dataclass(frozen=True)
+class RankTopology:
+    rank: int
+    pci_bdf: str
+    numa_node: int
+    compute_capability: str
+    vram_bytes: int
+    pcie_generation: int
+    pcie_width: int
+
+    def __post_init__(self) -> None:
+        if self.rank < 0 or not self.pci_bdf:
+            raise ValueError("rank topology requires a non-negative rank and PCI BDF")
+        if self.vram_bytes <= 0 or self.pcie_generation <= 0 or self.pcie_width <= 0:
+            raise ValueError("rank topology VRAM and negotiated PCIe link must be positive")
+
+
+@dataclass(frozen=True)
+class NodeMoePlacementInputs:
+    """All-rank inputs for one immutable startup placement decision."""
+
+    rank_inputs: tuple[MoePlacementInputs, ...]
+    rank_topology: tuple[RankTopology, ...]
+    routed_tp_layout: RoutedTpLayout
+    host_expert_budget_bytes: int
+    pin_budget_bytes: int
+    checkpoint_layout: str = "generic"
+
+
+@dataclass(frozen=True)
+class NodeMoePlacementPlan:
+    routed_tp_layout: RoutedTpLayout
+    rank_plans: tuple[MoePlacementPlan, ...]
+    rank_topology: tuple[RankTopology, ...]
+    retained_host_bytes: int
+    pinned_host_bytes: int
+    kv_pages: int
+    constraints: tuple[str, ...]
+    checksum: str
+
+    def canonical_dict(self) -> dict:
+        return {
+            "routed_tp_layout": self.routed_tp_layout.canonical_dict(),
+            "rank_topology": [topology.__dict__ for topology in self.rank_topology],
+            "rank_plans": [
+                {
+                    "layer_tiers": [tier.value for tier in plan.layer_tiers],
+                    "permanent_layer_ids": list(plan.permanent_layer_ids),
+                    "cpu_layer_ids": sorted(plan.cpu_layer_ids),
+                    "permanent_gpu_bytes": plan.permanent_gpu_bytes,
+                    "retained_host_bytes": plan.retained_host_bytes,
+                    "pinned_host_bytes": plan.pinned_host_bytes,
+                    "locked_host_bytes": plan.locked_host_bytes,
+                    "dynamic_cache_slots": plan.dynamic_cache_slots,
+                    "dynamic_floor_slots": plan.dynamic_floor_slots,
+                    "kv_pages": plan.kv_pages,
+                    "kv_bytes": plan.kv_bytes,
+                    "elastic_vram_bytes": plan.elastic_vram_bytes,
+                    "prefill_overlap": plan.prefill_overlap,
+                }
+                for plan in self.rank_plans
+            ],
+            "retained_host_bytes": self.retained_host_bytes,
+            "pinned_host_bytes": self.pinned_host_bytes,
+            "kv_pages": self.kv_pages,
+            "constraints": list(self.constraints),
+        }
+
+    def verify_checksum(self) -> None:
+        actual = _node_plan_checksum(self.canonical_dict())
+        if actual != self.checksum:
+            raise MoePlacementInfeasible(
+                f"node placement checksum mismatch: got {self.checksum}, recomputed {actual}"
+            )
 
 
 def _gib(value: int) -> str:
@@ -457,11 +537,133 @@ def plan_moe_placement(
     )
 
 
+def _apportion_budget(total: int, weights: Sequence[int]) -> tuple[int, ...]:
+    """Deterministic largest-remainder apportionment for node-shared budgets."""
+    if total < 0 or any(weight < 0 for weight in weights):
+        raise ValueError("node budgets and apportionment weights must be non-negative")
+    weight_sum = sum(weights)
+    if not weights:
+        return ()
+    if weight_sum == 0:
+        base, extra = divmod(total, len(weights))
+        return tuple(base + (rank < extra) for rank in range(len(weights)))
+    numerators = [total * weight for weight in weights]
+    result = [value // weight_sum for value in numerators]
+    remaining = total - sum(result)
+    order = sorted(
+        range(len(weights)),
+        key=lambda rank: (numerators[rank] % weight_sum, -rank),
+        reverse=True,
+    )
+    for rank in order[:remaining]:
+        result[rank] += 1
+    return tuple(result)
+
+
+def _node_plan_checksum(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def plan_node_moe_placement(
+    inputs: NodeMoePlacementInputs,
+    capabilities: Sequence[ExpertPlacementCapabilities],
+    *,
+    policy: str = "balanced",
+    allow_gpu_permanent: bool = True,
+    explicit_permanent_layer_ids: Iterable[int] = (),
+    explicit_permanent_layer_count: int | None = None,
+    explicit_cpu_layer_ids: Iterable[int] = (),
+    allow_additional_cpu_layers: bool = True,
+) -> NodeMoePlacementPlan:
+    """Jointly prove aggregate host/pin and every rank's VRAM/KV capacity.
+
+    Phase one accepts a startup-fixed layout and runs the existing mature local
+    solver with node-shared budgets apportioned by actual rank-local shard bytes,
+    rather than dividing them evenly.  The returned object is the global plan
+    that rank 0 broadcasts and every worker checksums before allocation.
+    """
+    rank_count = len(inputs.rank_inputs)
+    if rank_count == 0:
+        raise ValueError("node placement requires at least one rank")
+    if len(inputs.rank_topology) != rank_count or len(capabilities) != rank_count:
+        raise ValueError("rank inputs, topology and capabilities must have equal length")
+    if len(inputs.routed_tp_layout.widths) != rank_count:
+        raise ValueError("routed TP layout rank count does not match placement inputs")
+    if tuple(topology.rank for topology in inputs.rank_topology) != tuple(range(rank_count)):
+        raise ValueError("rank topology must be ordered and cover ranks 0..tp_size-1")
+    if inputs.host_expert_budget_bytes < 0 or inputs.pin_budget_bytes < 0:
+        raise ValueError("aggregate host and pin budgets must be non-negative")
+
+    equal_widths = len(set(inputs.routed_tp_layout.widths)) == 1
+    if not equal_widths and inputs.checkpoint_layout not in {
+        "dsv4_ds_fp4_safetensors", "synthetic"
+    }:
+        raise MoePlacementInfeasible(
+            "weighted routed TP requires original DSV4 DS-FP4 safetensors; "
+            f"checkpoint layout {inputs.checkpoint_layout!r} is unsupported"
+        )
+
+    host_weights = [sum(rank.host_bytes_per_layer) for rank in inputs.rank_inputs]
+    pin_weights = host_weights
+    host_budgets = _apportion_budget(inputs.host_expert_budget_bytes, host_weights)
+    pin_budgets = _apportion_budget(inputs.pin_budget_bytes, pin_weights)
+
+    rank_plans = tuple(
+        plan_moe_placement(
+            replace(
+                rank_input,
+                host_expert_budget_bytes=min(host_weights[rank], host_budgets[rank]),
+                pin_budget_bytes=min(host_weights[rank], pin_budgets[rank]),
+            ),
+            capabilities[rank],
+            policy=policy,
+            allow_gpu_permanent=allow_gpu_permanent,
+            explicit_permanent_layer_ids=explicit_permanent_layer_ids,
+            explicit_permanent_layer_count=explicit_permanent_layer_count,
+            explicit_cpu_layer_ids=explicit_cpu_layer_ids,
+            allow_additional_cpu_layers=allow_additional_cpu_layers,
+        )
+        for rank, rank_input in enumerate(inputs.rank_inputs)
+    )
+    retained = sum(plan.retained_host_bytes for plan in rank_plans)
+    pinned = sum(plan.pinned_host_bytes for plan in rank_plans)
+    if retained > inputs.host_expert_budget_bytes:
+        raise AssertionError("joint planner exceeded aggregate host budget")
+    if pinned > inputs.pin_budget_bytes:
+        raise AssertionError("joint planner exceeded aggregate pin budget")
+    kv_pages = min(plan.kv_pages for plan in rank_plans)
+    constraints = (
+        f"aggregate host expert bytes {retained} <= {inputs.host_expert_budget_bytes}",
+        f"aggregate pinned expert bytes {pinned} <= {inputs.pin_budget_bytes}",
+        f"KV pages use all-rank lower bound {kv_pages}",
+        "each rank satisfies fixed + permanent + dynamic + KV + graph reserve <= VRAM",
+    )
+    provisional = NodeMoePlacementPlan(
+        routed_tp_layout=inputs.routed_tp_layout,
+        rank_plans=rank_plans,
+        rank_topology=inputs.rank_topology,
+        retained_host_bytes=retained,
+        pinned_host_bytes=pinned,
+        kv_pages=kv_pages,
+        constraints=constraints,
+        checksum="",
+    )
+    checksum = _node_plan_checksum(provisional.canonical_dict())
+    result = replace(provisional, checksum=checksum)
+    result.verify_checksum()
+    return result
+
+
 __all__ = [
     "ExpertPlacementCapabilities",
     "ExpertTier",
     "MoePlacementInfeasible",
     "MoePlacementInputs",
     "MoePlacementPlan",
+    "NodeMoePlacementInputs",
+    "NodeMoePlacementPlan",
+    "RankTopology",
     "plan_moe_placement",
+    "plan_node_moe_placement",
 ]

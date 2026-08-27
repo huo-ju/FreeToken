@@ -18,6 +18,7 @@ from typing import Iterator
 import safetensors
 import torch
 from freetoken.distributed import get_tp_info
+from freetoken.moe.execution_plan import RoutedTpLayout
 from tqdm import tqdm
 
 from freetoken.models.loader import drop_page_cache
@@ -234,6 +235,8 @@ _EXPERT_RE = re.compile(
 
 def dsfp4_expert_bank_specs(
     args: DeepseekV4Args,
+    *,
+    routed_tp_widths: tuple[int, ...] | None = None,
 ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """Per-rank host/cache shapes for DeepSeek-FP4 routed experts.
 
@@ -245,18 +248,14 @@ def dsfp4_expert_bank_specs(
     """
     tp = get_tp_info()
     E, H = args.n_routed_experts, args.dim
-    if args.moe_inter_dim % tp.size:
-        raise ValueError(
-            f"DeepSeek-FP4 moe_inter_dim={args.moe_inter_dim} is not divisible by "
-            f"tp_size={tp.size}"
-        )
-    I = div_even(args.moe_inter_dim, tp.size)
-    if I % 256:
-        raise ValueError(
-            f"DeepSeek-FP4 TP shard width {I} must be divisible by the decode "
-            f"kernel's 256-value K tile (moe_inter_dim={args.moe_inter_dim}, "
-            f"tp_size={tp.size})"
-        )
+    layout = (
+        RoutedTpLayout.equal(args.moe_inter_dim, tp.size, alignment=256)
+        if routed_tp_widths is None
+        else RoutedTpLayout.from_widths(routed_tp_widths, alignment=256)
+    )
+    if len(layout.widths) != tp.size or layout.total_intermediate_size != args.moe_inter_dim:
+        raise ValueError("routed TP layout does not match DSV4 intermediate size / TP size")
+    I = layout.widths[tp.rank]
     e8m0 = torch.float8_e8m0fnu
     return {
         "gate_up_packed": ((E, 2 * I, H // 2), torch.uint8),
@@ -327,6 +326,7 @@ def load_dsfp4_expert_sources(
     layer_sink=None,
     layer_residency: list[str] | None = None,
     gpu_sink=None,
+    routed_tp_widths: tuple[int, ...] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build pinned CPU DeepSeek-FP4 banks for the routed experts.
 
@@ -364,7 +364,7 @@ def load_dsfp4_expert_sources(
 
     # Allocate only this rank's intermediate slice. This is the host-RAM half of
     # expert TP; the matching GPU kernels infer local I from these bank shapes.
-    specs = dsfp4_expert_bank_specs(args)
+    specs = dsfp4_expert_bank_specs(args, routed_tp_widths=routed_tp_widths)
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
@@ -379,6 +379,7 @@ def load_dsfp4_expert_sources(
                     layer = _place_dsfp4(
                         banks, name, f.get_tensor(name), I,
                         tp_rank=tp.rank, tp_size=tp.size,
+                        routed_tp_widths=routed_tp_widths,
                     )
                     tracker.note(layer)
                     placed += 1
@@ -400,12 +401,13 @@ def dummy_dsfp4_expert_sources(
     *,
     layer_residency: list[str] | None = None,
     gpu_sink=None,
+    routed_tp_widths: tuple[int, ...] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Fabricate the 4 ds_fp4 banks for --dummy-weight (no checkpoint on disk)."""
     from freetoken.moe.host_banks import alloc_layer_banks
 
     L, E = args.n_layers, args.n_routed_experts
-    specs = dsfp4_expert_bank_specs(args)
+    specs = dsfp4_expert_bank_specs(args, routed_tp_widths=routed_tp_widths)
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
@@ -439,14 +441,24 @@ def _place_dsfp4(
     *,
     tp_rank: int = 0,
     tp_size: int = 1,
+    routed_tp_widths: tuple[int, ...] | None = None,
 ) -> int:
     """Copy one expert tensor into its layer/expert slot (shared by serial + parallel
     readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index."""
     m = _EXPERT_RE.match(name)
     layer, expert = int(m.group("layer")), int(m.group("expert"))
     proj, kind = m.group("proj"), m.group("kind")
-    local_i = div_even(I, tp_size)
-    i0, i1 = tp_rank * local_i, (tp_rank + 1) * local_i
+    # The serving bank specs validate the production 256-value tile.  Keep the
+    # low-level placement helper geometry-neutral for tiny loader unit fixtures.
+    layout = (
+        RoutedTpLayout.equal(I, tp_size)
+        if routed_tp_widths is None
+        else RoutedTpLayout.from_widths(routed_tp_widths, alignment=1)
+    )
+    if len(layout.widths) != tp_size or layout.total_intermediate_size != I:
+        raise ValueError("routed TP layout does not match expert tensor / TP size")
+    local_i = layout.widths[tp_rank]
+    i0, i1 = layout.offsets[tp_rank], layout.offsets[tp_rank] + local_i
     if kind == "weight":
         t = t.view(torch.uint8)
         if proj == "w1":
@@ -468,6 +480,7 @@ def _place_dsfp4(
 def load_dsfp4_expert_sources_parallel(
     model_path: str, args: DeepseekV4Args, *, workers: int = 8, chunk: int = 8 << 20,
     layer_sink=None, layer_residency: list[str] | None = None, gpu_sink=None,
+    routed_tp_widths: tuple[int, ...] | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel path: same banks as load_dsfp4_expert_sources, filled from the common
     chunked multi-threaded O_DIRECT reader instead of serial per-shard safe_open.
@@ -478,7 +491,7 @@ def load_dsfp4_expert_sources_parallel(
     L, E = args.n_layers, args.n_routed_experts
     I = args.moe_inter_dim
     tp = get_tp_info()
-    specs = dsfp4_expert_bank_specs(args)
+    specs = dsfp4_expert_bank_specs(args, routed_tp_widths=routed_tp_widths)
     hb = alloc_layer_banks(specs, L)  # lazy host banks (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
@@ -491,7 +504,8 @@ def load_dsfp4_expert_sources_parallel(
         placed = 0
         for name, t in iter_expert_tensors_parallel(model_path, _is_expert, workers=workers, chunk=chunk):
             layer = _place_dsfp4(
-                banks, name, t, I, tp_rank=tp.rank, tp_size=tp.size
+                banks, name, t, I, tp_rank=tp.rank, tp_size=tp.size,
+                routed_tp_widths=routed_tp_widths,
             )
             tracker.note(layer)
             placed += 1

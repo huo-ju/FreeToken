@@ -47,7 +47,15 @@ MODELS = {
     # gpt-oss MXFP4 (block-32 e2m1 codes + e8m0 scales), H == I == 2880, top-4 routing
     "gpt-oss-20b": ModelProfile(24, 32, 4, "mxfp4_triton", 2880, 2880),
     "gpt-oss-120b": ModelProfile(36, 128, 4, "mxfp4_triton", 2880, 2880),
+    # DSV4 routed-expert local-width sweep.  These are the P0 equal/weighted
+    # layout calibration points; select them explicitly with --models and use
+    # --cache-slots sized for the target GPU.
+    "dsv4-dsfp4-i256": ModelProfile(43, 256, 6, "ds_fp4", 4096, 256),
+    "dsv4-dsfp4-i512": ModelProfile(43, 256, 6, "ds_fp4", 4096, 512),
+    "dsv4-dsfp4-i768": ModelProfile(43, 256, 6, "ds_fp4", 4096, 768),
+    "dsv4-dsfp4-i2048": ModelProfile(43, 256, 6, "ds_fp4", 4096, 2048),
 }
+DEFAULT_MODELS = tuple(name for name in MODELS if not name.startswith("dsv4-dsfp4"))
 
 
 def bank_specs(profile: ModelProfile) -> dict[str, tuple[int, torch.dtype]]:
@@ -58,10 +66,16 @@ def bank_specs(profile: ModelProfile) -> dict[str, tuple[int, torch.dtype]]:
         "down": (h * i, torch.bfloat16),
         # packed e2m1 codes (2 weights/byte) + fp8-e4m3 per-16 block scales
         "gate_up_packed": (2 * i * (h // 2), torch.uint8),
-        "gate_up_scale": (2 * i * (h // 16), torch.uint8),
+        "gate_up_scale": (
+            2 * i * (h // (32 if profile.quant_format == "ds_fp4" else 16)),
+            torch.uint8,
+        ),
         "gate_up_global": (2 * i, torch.float16),
         "down_packed": (h * (i // 2), torch.uint8),
-        "down_scale": (h * (i // 16), torch.uint8),
+        "down_scale": (
+            h * (i // (32 if profile.quant_format == "ds_fp4" else 16)),
+            torch.uint8,
+        ),
         "down_global": (h, torch.float16),
         # gpt-oss mxfp4 transposed (_t) banks: e2m1 codes (2 weights/byte) + e8m0
         # per-32 block scales (uint8), plus a per-output bias in compute dtype
@@ -84,7 +98,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", type=single_gpu_arg, default=None,
                         help="GPU UUID or nvidia-smi index (default: the first visible GPU)")
     parser.add_argument("--repeat", type=int, default=25)
-    parser.add_argument("--models", type=str, nargs="+", default=list(MODELS), choices=list(MODELS))
+    parser.add_argument(
+        "--models", type=str, nargs="+", default=list(DEFAULT_MODELS), choices=list(MODELS)
+    )
     parser.add_argument(
         "--cache-slots",
         type=int,
@@ -94,7 +110,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16, 32])
     parser.add_argument("--miss-rates", type=float, nargs="+", default=[0.0, 0.25, 0.5, 1.0])
-    return parser.parse_args()
+    parser.add_argument(
+        "--miss-counts", type=int, nargs="+", default=None,
+        help="exact unique misses per case (clamped to active experts); overrides --miss-rates",
+    )
+    args = parser.parse_args()
+    if args.miss_counts is not None and any(count < 0 for count in args.miss_counts):
+        parser.error("--miss-counts values must be non-negative")
+    return args
 
 
 def make_cache(profile: ModelProfile, cache_slots: int, device: torch.device) -> OffloadMoeCache:
@@ -195,6 +218,7 @@ def print_table(
     cache_slots: int,
     batch_sizes: list[int],
     miss_rates: list[float],
+    miss_counts: list[int] | None,
     repeat: int,
     device: torch.device,
 ) -> None:
@@ -211,7 +235,12 @@ def print_table(
 
     cache = make_cache(profile, cache_slots, device)
     for batch_size in batch_sizes:
-        for miss_rate in miss_rates:
+        active_unique = min(profile.experts, batch_size * profile.topk)
+        case_rates = (
+            [min(active_unique, count) / active_unique for count in miss_counts]
+            if miss_counts is not None else miss_rates
+        )
+        for miss_rate in case_rates:
             active, misses, time_ms = time_case(
                 cache, profile, batch_size, miss_rate, repeat, device
             )
@@ -245,7 +274,14 @@ def main() -> None:
         ]
         for cache_slots in slot_counts:
             print_table(
-                name, profile, cache_slots, args.batch_sizes, args.miss_rates, args.repeat, device
+                name,
+                profile,
+                cache_slots,
+                args.batch_sizes,
+                args.miss_rates,
+                args.miss_counts,
+                args.repeat,
+                device,
             )
 
 

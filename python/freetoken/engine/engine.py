@@ -3,7 +3,9 @@ from __future__ import annotations
 import gc
 import math
 import os
+from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
 import torch
@@ -29,6 +31,46 @@ from freetoken.kvcache.linear_state_pool import (
 )
 
 logger = init_logger(__name__)
+
+
+def _local_rank_topology(device: torch.device, rank: int):
+    """Small, read-only topology snapshot for startup plan identity.
+
+    Placement does not score these fields yet; they prevent an asymmetric plan
+    from being mistaken for a different rank ordering. Missing sysfs metadata
+    falls back to conservative positive values rather than adding subprocess or
+    NVML dependencies to engine startup.
+    """
+    from freetoken.engine.moe_placement import RankTopology
+
+    props = torch.cuda.get_device_properties(device)
+    bdf = (
+        f"{props.pci_domain_id:04x}:{props.pci_bus_id:02x}:"
+        f"{props.pci_device_id:02x}.0"
+    )
+    sysfs = Path("/sys/bus/pci/devices") / bdf
+
+    def _read_int(name: str, fallback: int) -> int:
+        try:
+            return int((sysfs / name).read_text().strip())
+        except (OSError, ValueError):
+            return fallback
+
+    try:
+        speed = float((sysfs / "current_link_speed").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        speed = 2.5
+    generations = ((64.0, 6), (32.0, 5), (16.0, 4), (8.0, 3), (5.0, 2))
+    generation = next((gen for threshold, gen in generations if speed >= threshold), 1)
+    return RankTopology(
+        rank=rank,
+        pci_bdf=bdf,
+        numa_node=_read_int("numa_node", -1),
+        compute_capability=f"sm{props.major}{props.minor}",
+        vram_bytes=props.total_memory,
+        pcie_generation=generation,
+        pcie_width=_read_int("current_link_width", 1),
+    )
 
 
 def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
@@ -334,6 +376,7 @@ class Engine:
 
         self.tp_cpu_group = self._init_communication(config)
         free_min, free_max = self._sync_get_memory()
+        self._rank_baseline_free = get_free_memory(self.device)
         init_free_memory = free_max  # startup KV sizing keeps cross-rank MAX (unchanged)
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
@@ -344,7 +387,9 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         post_weights_free = self._sync_get_memory()[0]
+        rank_post_weights_free = get_free_memory(self.device)
         self._weights_bytes = self._baseline_free - post_weights_free
+        self._rank_weights_bytes = self._rank_baseline_free - rank_post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
         # resident but before ANY runtime cache pool (MoE expert cache below, KV pages, GDN
         # state) is allocated. This is the stable "if all free VRAM went to one pool" budget —
@@ -549,8 +594,10 @@ class Engine:
         from freetoken.engine.moe_placement import (
             ExpertPlacementCapabilities,
             MoePlacementInputs,
-            plan_moe_placement,
+            NodeMoePlacementInputs,
+            plan_node_moe_placement,
         )
+        from freetoken.moe.execution_plan import RoutedTpLayout
 
         per_slot = expert_bytes_per_slot_from_specs(specs)
         layers = config.model_config.num_moe_layers
@@ -560,34 +607,24 @@ class Engine:
 
         tp_size = max(1, config.tp_info.size)
         if config.moe_host_budget_gb is not None:
-            host_budget = int(config.moe_host_budget_gb * 2**30) // tp_size
+            # Host RAM is node-shared. The node planner apportions this aggregate
+            # budget using actual rank-local shard bytes.
+            host_budget = int(config.moe_host_budget_gb * 2**30)
         else:
-            available = None
-            try:
-                with open("/proc/meminfo", encoding="utf-8") as meminfo:
-                    for line in meminfo:
-                        if line.startswith("MemAvailable:"):
-                            available = int(line.split()[1]) * 1024
-                            break
-            except OSError:
-                pass
-            if available is None:
-                host_budget = host_total
-            else:
-                # Keep room for allocator/loader transients and the rest of the
-                # process.  This is deliberately conservative and observable.
-                safety = max(4 * 2**30, available // 10)
-                host_budget = max(0, available - safety) // tp_size
+            # Compatibility default: the legacy DSV4 path retained every routed
+            # expert shard on host and let the allocation itself be authoritative.
+            # MemAvailable during TP-worker startup includes large transient
+            # process/driver costs and falsely rejected configurations already
+            # proven to serve. Only an explicit user budget is a hard host cap.
+            host_budget = None
 
         explicit_pin = config.moe_pin_budget_gb
         detected_pin = _pin_budget_bytes()
         pin_budget = (
             int(explicit_pin * 2**30)
             if explicit_pin is not None
-            else (detected_pin if detected_pin is not None else host_total)
+            else detected_pin
         )
-        if explicit_pin is not None or detected_pin is not None:
-            pin_budget //= tp_size
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)
@@ -616,54 +653,140 @@ class Engine:
         )
         requested_permanent = config.moe_gpu_only_layers
         manual = config.moe_placement == "manual"
-        plan = plan_moe_placement(
-            MoePlacementInputs(
-                available_vram_bytes=self._baseline_free,
-                fixed_gpu_bytes=self._weights_bytes + fixed_cache_size,
-                activation_graph_reserve_bytes=int(
-                    (1.0 - config.memory_ratio) * self._baseline_free
-                ),
-                host_expert_budget_bytes=min(host_total, host_budget),
-                pin_budget_bytes=min(host_total, pin_budget),
-                kv_reserve_bytes=reserve_bytes,
-                expert_bytes_per_slot=per_slot,
-                host_bytes_per_layer=(per_layer,) * layers,
-                gpu_bytes_per_layer=(per_layer,) * layers,
-                num_experts=experts,
-                prefill_overlap=config.moe_prefill_overlap,
-                dynamic_cache_slots=requested_dynamic,
-                kv_page_bytes=cache_per_page,
-                kv_reserve_pages=reserve_pages,
+        local_inputs = MoePlacementInputs(
+            available_vram_bytes=self._rank_baseline_free,
+            fixed_gpu_bytes=self._rank_weights_bytes + fixed_cache_size,
+            activation_graph_reserve_bytes=int(
+                (1.0 - config.memory_ratio) * self._rank_baseline_free
             ),
+            # The joint planner replaces these placeholders with an aggregate
+            # apportionment after all rank-local shard sizes are gathered.
+            host_expert_budget_bytes=host_total,
+            pin_budget_bytes=host_total,
+            kv_reserve_bytes=reserve_bytes,
+            expert_bytes_per_slot=per_slot,
+            host_bytes_per_layer=(per_layer,) * layers,
+            gpu_bytes_per_layer=(per_layer,) * layers,
+            num_experts=experts,
+            prefill_overlap=config.moe_prefill_overlap,
+            dynamic_cache_slots=requested_dynamic,
+            kv_page_bytes=cache_per_page,
+            kv_reserve_pages=reserve_pages,
+        )
+        local_payload = (
+            local_inputs,
             caps,
-            policy=config.moe_placement_policy,
-            allow_gpu_permanent=(requested_permanent != 0 and not (manual and requested_permanent < 0)),
-            explicit_permanent_layer_count=(
-                requested_permanent if requested_permanent > 0 else None
-            ),
-            explicit_cpu_layer_ids=explicit_cpu_layer_ids,
-            allow_additional_cpu_layers=(
-                not manual
-                and config.moe_cpu_layers is None
-                and config.moe_backend != "cpu"
-            ),
+            _local_rank_topology(self.device, config.tp_info.rank),
+            host_budget,
+            pin_budget,
+        )
+        gathered: list[object | None] = [None] * tp_size
+        torch.distributed.all_gather_object(
+            gathered, local_payload, group=self.tp_cpu_group
+        )
+
+        wire: list[object | None] = [None]
+        if config.tp_info.rank == 0:
+            try:
+                payloads = [payload for payload in gathered if payload is not None]
+                rank_inputs = tuple(payload[0] for payload in payloads)
+                capabilities = tuple(payload[1] for payload in payloads)
+                topology = tuple(payload[2] for payload in payloads)
+                full_host_banks = sum(
+                    sum(rank_input.host_bytes_per_layer)
+                    for rank_input in rank_inputs
+                )
+                aggregate_host_budget = (
+                    full_host_banks
+                    if payloads[0][3] is None
+                    else int(payloads[0][3])
+                )
+                aggregate_pin_budget = (
+                    full_host_banks
+                    if payloads[0][4] is None
+                    else int(payloads[0][4])
+                )
+                widths = config.model_config.routed_moe_tp_widths
+                assert widths is not None
+                routed_layout = RoutedTpLayout.from_widths(widths, alignment=256)
+                node_plan = plan_node_moe_placement(
+                    NodeMoePlacementInputs(
+                        rank_inputs=rank_inputs,
+                        rank_topology=topology,
+                        routed_tp_layout=routed_layout,
+                        host_expert_budget_bytes=aggregate_host_budget,
+                        pin_budget_bytes=aggregate_pin_budget,
+                        checkpoint_layout=("ftw" if ftw else "dsv4_ds_fp4_safetensors"),
+                    ),
+                    capabilities,
+                    policy=config.moe_placement_policy,
+                    allow_gpu_permanent=(
+                        requested_permanent != 0
+                        and not (manual and requested_permanent < 0)
+                    ),
+                    explicit_permanent_layer_count=(
+                        requested_permanent if requested_permanent > 0 else None
+                    ),
+                    explicit_cpu_layer_ids=explicit_cpu_layer_ids,
+                    allow_additional_cpu_layers=(
+                        not manual
+                        and config.moe_cpu_layers is None
+                        and config.moe_backend != "cpu"
+                        and config.moe_execution_policy
+                        not in ("force_equal_tp", "force_weighted_tp")
+                    ),
+                )
+                wire[0] = {"plan": node_plan, "error": None}
+            except Exception as error:  # propagate instead of stranding other ranks
+                wire[0] = {
+                    "plan": None,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+        torch.distributed.broadcast_object_list(
+            wire, src=0, group=self.tp_cpu_group
+        )
+        result = wire[0]
+        assert isinstance(result, dict)
+        if result["error"] is not None:
+            raise ValueError(f"node MoE placement failed: {result['error']}")
+        node_plan = result["plan"]
+        node_plan.verify_checksum()
+        self.node_moe_placement_plan = node_plan
+        # KV must use the all-rank lower bound. Keep the local plan otherwise:
+        # weighted layouts legitimately produce rank-specific slots/residency.
+        plan = replace(
+            node_plan.rank_plans[config.tp_info.rank],
+            kv_pages=node_plan.kv_pages,
+            kv_bytes=node_plan.kv_pages * cache_per_page,
         )
         object.__setattr__(config, "moe_cache_size", plan.dynamic_cache_slots)
         object.__setattr__(config, "moe_prefill_overlap", plan.prefill_overlap)
         if config.num_page_override is None:
-            object.__setattr__(config, "num_page_override", plan.kv_pages)
+            object.__setattr__(config, "num_page_override", node_plan.kv_pages)
         self.moe_placement_plan = plan
+        local_width = node_plan.routed_tp_layout.widths[config.tp_info.rank]
+        local_offset = node_plan.routed_tp_layout.offsets[config.tp_info.rank]
+        dynamic_bytes = plan.dynamic_cache_slots * local_inputs.expert_bytes_per_slot
+        vram_headroom = plan.elastic_vram_bytes - dynamic_bytes - plan.kv_bytes
+        logger.info(
+            f"MoE rank {config.tp_info.rank} routed layout: width={local_width}, "
+            f"offset={local_offset}, expert_slot={mem_GB(local_inputs.expert_bytes_per_slot)}, "
+            f"host={mem_GB(plan.retained_host_bytes)}, "
+            f"permanent={mem_GB(plan.permanent_gpu_bytes)}, "
+            f"dynamic={mem_GB(dynamic_bytes)}, KV={mem_GB(plan.kv_bytes)}, "
+            f"headroom={mem_GB(vram_headroom)}"
+        )
         logger.info_rank0(
-            "MoE placement plan\n"
+            f"MoE node placement plan (checksum {node_plan.checksum[:12]})\n"
             f"  GPU permanent:      {len(plan.permanent_layer_ids)} layers / "
-            f"{mem_GB(plan.permanent_gpu_bytes)} per rank\n"
+            f"{mem_GB(plan.permanent_gpu_bytes)} on rank 0\n"
             f"  host retained:      {len(plan.layer_tiers) - len(plan.permanent_layer_ids)} "
-            f"layers / {mem_GB(plan.retained_host_bytes)} per rank\n"
+            f"layers / {mem_GB(node_plan.retained_host_bytes)} aggregate\n"
             f"    pinned:           {mem_GB(plan.pinned_host_bytes)}\n"
             f"    locked:           {mem_GB(plan.locked_host_bytes)}\n"
             f"  dynamic GPU cache:  {plan.dynamic_cache_slots} slots "
             f"(floor {plan.dynamic_floor_slots})\n"
-            f"  KV reserve/plan:    {reserve_pages}/{plan.kv_pages} pages\n"
+            f"  KV reserve/plan:    {reserve_pages}/{node_plan.kv_pages} pages\n"
             f"  prefill overlap:    {plan.prefill_overlap}\n"
             f"  decisions:          {'; '.join(plan.decisions) or 'all-host baseline'}"
         )
@@ -956,6 +1079,19 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        cache.execution_policy = config.moe_execution_policy
+        from freetoken.moe.execution_plan import ExecutionPolicy, ExecutionPolicyAdapter
+
+        cache.execution_policy_adapter = ExecutionPolicyAdapter(
+            policy=ExecutionPolicy(config.moe_execution_policy),
+            plan_epoch=cache.plan_epoch,
+            tp_size=config.tp_info.size,
+        )
+        cache.execution_policy_adapter.validate_backend(
+            decode_target=cache.decode_target,
+            cpu_layer_ids=cache.cpu_layer_ids,
+            gpu_resident_layer_ids=cache.gpu_resident_layer_ids,
+        )
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
@@ -1045,11 +1181,20 @@ class Engine:
         min_free_memory = int(free_mem_tensor[0].item())
         max_free_memory = -int(free_mem_tensor[1].item())
         if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
-            logger.error(
-                f"Memory across TP ranks are imbalanced:"
-                f" min {mem_GB(min_free_memory)}, max {mem_GB(max_free_memory)}"
+            message = (
+                f"Memory across TP ranks are imbalanced: min {mem_GB(min_free_memory)}, "
+                f"max {mem_GB(max_free_memory)}"
             )
-            raise RuntimeError("Memory across TP ranks are imbalanced")
+            if (
+                is_offload_moe_backend(self.config.moe_backend)
+                and getattr(self.config.model_config, "dsv4_args", None) is not None
+            ):
+                logger.warning_rank0(
+                    message + "; startup placement will validate each rank independently"
+                )
+            else:
+                logger.error(message)
+                raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
 
@@ -1545,6 +1690,8 @@ def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[int
 # MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
+    "moe_execution_policy": "compatibility",
+    "moe_tp_layout": "equal",
     "moe_cache_size": 0,
     "moe_cache_rate": None,
     "moe_cache_auto": False,
@@ -1636,21 +1783,43 @@ def _adjust_config(config: EngineConfig):
     if config.cuda_graph_max_bs is None:
         override("cuda_graph_max_bs", config.max_running_req)
 
+    layout_setting = getattr(config, "moe_tp_layout", "equal")
     if is_dsv4:
         _adjust_dsv4_config(config, override)
-        if (
-            getattr(getattr(config, "tp_info", None), "size", 1) > 1
-            and getattr(config, "model_path", None)
-            and not getattr(config, "use_dummy_weight", False)
-        ):
-            from freetoken.checkpoint.ftw import is_ftw_checkpoint
+        # DSV4 attention can be tested/used independently of routed experts.
+        # Weight layout validation belongs only to the MoE checkpoint path.
+        if is_moe:
+            if (
+                getattr(getattr(config, "tp_info", None), "size", 1) > 1
+                and getattr(config, "model_path", None)
+                and not getattr(config, "use_dummy_weight", False)
+            ):
+                from freetoken.checkpoint.ftw import is_ftw_checkpoint
 
-            if is_ftw_checkpoint(config.model_path):
+                if is_ftw_checkpoint(config.model_path):
+                    raise ValueError(
+                        "DeepSeek-V4 tensor parallelism currently requires the original "
+                        "safetensors checkpoint. FTW expert banks were written in a TP=1 "
+                        "layout and cannot be safely sharded at serve time."
+                    )
+            from freetoken.moe.execution_plan import resolve_routed_tp_layout
+
+            tp_size = getattr(getattr(config, "tp_info", None), "size", 1)
+            routed_layout = resolve_routed_tp_layout(
+                layout_setting,
+                total_intermediate_size=model_config.moe_intermediate_size,
+                tp_size=tp_size,
+                alignment=256,
+            )
+            if layout_setting != "equal" and expert_quant != "ds_fp4":
                 raise ValueError(
-                    "DeepSeek-V4 tensor parallelism currently requires the original "
-                    "safetensors checkpoint. FTW expert banks were written in a TP=1 "
-                    "layout and cannot be safely sharded at serve time."
+                    "weighted routed TP currently supports only DSV4 DS-FP4 experts"
                 )
+            object.__setattr__(
+                model_config, "routed_moe_tp_widths", routed_layout.widths
+            )
+    elif layout_setting != "equal":
+        raise ValueError("weighted routed TP currently supports only DSV4 DS-FP4 checkpoints")
 
     if has_swa_attention:
         # Both SWA cache paths use the global-paged swa pool (page_size==1 only for now).

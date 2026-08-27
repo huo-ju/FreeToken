@@ -270,6 +270,7 @@ def _dsfp4_banks(
 ) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
+    routed_tp_widths = model_config.routed_moe_tp_widths
     # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
     # no alphas. DeepSeek-V4's own grouped GEMV kernels read them via bank_views().
     # Written as-loaded -> streamable (dummy fabricates in one shot; never streamed).
@@ -278,7 +279,8 @@ def _dsfp4_banks(
         from freetoken.models.deepseek_v4.weight import dummy_dsfp4_expert_sources
 
         banks = dummy_dsfp4_expert_sources(
-            args, layer_residency=layer_residency, gpu_sink=gpu_sink
+            args, layer_residency=layer_residency, gpu_sink=gpu_sink,
+            routed_tp_widths=routed_tp_widths,
         )
     elif parallel:  # parallel: common chunked multi-threaded O_DIRECT reader
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources_parallel
@@ -286,6 +288,7 @@ def _dsfp4_banks(
         banks = load_dsfp4_expert_sources_parallel(
             model_path, args, workers=workers, chunk=chunk, layer_sink=sink,
             layer_residency=layer_residency, gpu_sink=gpu_sink,
+            routed_tp_widths=routed_tp_widths,
         )
     else:
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
@@ -293,6 +296,7 @@ def _dsfp4_banks(
         banks = load_dsfp4_expert_sources(
             model_path, args, layer_sink=sink,
             layer_residency=layer_residency, gpu_sink=gpu_sink,
+            routed_tp_widths=routed_tp_widths,
         )
     return ExpertBanks(
         "ds_fp4",
@@ -311,7 +315,10 @@ def expert_bank_specs(model_config) -> dict[str, tuple[tuple[int, ...], torch.dt
     if getattr(model_config, "expert_quant", None) == "ds_fp4":
         from freetoken.models.deepseek_v4.weight import dsfp4_expert_bank_specs
 
-        return dsfp4_expert_bank_specs(model_config.dsv4_args)
+        return dsfp4_expert_bank_specs(
+            model_config.dsv4_args,
+            routed_tp_widths=model_config.routed_moe_tp_widths,
+        )
     return None
 
 

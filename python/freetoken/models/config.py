@@ -224,6 +224,9 @@ class ModelConfig:
     expert_quant: str = "none"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend); injected from EngineConfig.
     nvfp4_backend: str = "triton"
+    # Engine-resolved startup-only routed MoE widths. None means the provider's
+    # legacy equal TP partition; model-specific loaders may consume this tuple.
+    routed_moe_tp_widths: tuple[int, ...] | None = None
     # Block size (out, in) for block-wise weight quantization (fp8_block: (128, 128)).
     weight_block_size: tuple[int, int] | None = None
     # Weight quantization of the *dense* attention / GatedDeltaNet projections (separate

@@ -30,6 +30,26 @@ def test_dsv4_tp4_bank_specs_are_quarter_sized(monkeypatch):
     assert specs["down_scale"][0] == (2, 64, 8)
 
 
+def test_dsv4_weighted_tp_bank_specs_use_rank_local_width(monkeypatch):
+    import freetoken.distributed.info as info
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.deepseek_v4.args import DeepseekV4Args
+    from freetoken.models.deepseek_v4.weight import dsfp4_expert_bank_specs
+
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank=2, size=4))
+    args = DeepseekV4Args(
+        n_layers=1, n_routed_experts=2, dim=64, moe_inter_dim=2048,
+        compress_ratios=(0,),
+    )
+    specs = dsfp4_expert_bank_specs(
+        args, routed_tp_widths=(512, 512, 768, 256)
+    )
+    assert specs["gate_up_packed"][0] == (2, 1536, 32)
+    assert specs["gate_up_scale"][0] == (2, 1536, 2)
+    assert specs["down_packed"][0] == (2, 64, 384)
+    assert specs["down_scale"][0] == (2, 64, 24)
+
+
 def test_dsv4_tp4_placement_slices_gate_output_and_down_input():
     from freetoken.models.deepseek_v4.weight import _place_dsfp4
 
@@ -62,6 +82,40 @@ def test_dsv4_tp4_placement_slices_gate_output_and_down_input():
     torch.testing.assert_close(
         banks["down_packed"][0][0], down[:, lo // 2:hi // 2]
     )
+    torch.testing.assert_close(
+        banks["down_scale"][0][0], down_scale[:, lo // 32:hi // 32]
+    )
+
+
+def test_dsv4_weighted_tp_placement_uses_layout_offsets():
+    from freetoken.models.deepseek_v4.weight import _place_dsfp4
+
+    E, H, I = 1, 64, 256
+    widths = (64, 64, 96, 32)
+    rank, local_i, lo, hi = 2, 96, 128, 224
+    banks = {
+        "gate_up_packed": [torch.empty(E, 2 * local_i, H // 2, dtype=torch.uint8)],
+        "gate_up_scale": [torch.empty(E, 2 * local_i, H // 32, dtype=torch.uint8)],
+        "down_packed": [torch.empty(E, H, local_i // 2, dtype=torch.uint8)],
+        "down_scale": [torch.empty(E, H, local_i // 32, dtype=torch.uint8)],
+    }
+    row = torch.arange(I, dtype=torch.uint8).view(I, 1).expand(I, H // 2).clone()
+    scale = torch.arange(I, dtype=torch.uint8).view(I, 1).expand(I, H // 32).clone()
+    down = torch.arange(H * (I // 2), dtype=torch.int64).view(H, I // 2).to(torch.uint8)
+    down_scale = torch.arange(H * (I // 32), dtype=torch.int64).view(H, I // 32).to(torch.uint8)
+    base = "layers.0.ffn.experts.0"
+    for proj, kind, tensor in (
+        ("w1", "weight", row), ("w3", "weight", row + 1),
+        ("w1", "scale", scale), ("w3", "scale", scale + 1),
+        ("w2", "weight", down), ("w2", "scale", down_scale),
+    ):
+        _place_dsfp4(
+            banks, f"{base}.{proj}.{kind}", tensor, I,
+            tp_rank=rank, tp_size=4, routed_tp_widths=widths,
+        )
+    torch.testing.assert_close(banks["gate_up_packed"][0][0, :local_i], row[lo:hi])
+    torch.testing.assert_close(banks["gate_up_packed"][0][0, local_i:], row[lo:hi] + 1)
+    torch.testing.assert_close(banks["down_packed"][0][0], down[:, lo // 2:hi // 2])
     torch.testing.assert_close(
         banks["down_scale"][0][0], down_scale[:, lo // 32:hi // 32]
     )
@@ -160,6 +214,30 @@ def test_dsv4_tp4_shared_expert_partials_sum_to_unsharded_output():
             @ w2[:, lo:hi].T
         )
 
+    torch.testing.assert_close(torch.stack(partials).sum(0), full)
+
+
+def test_dsv4_weighted_routed_partials_sum_to_unsharded_output():
+    """Unequal intermediate slices preserve the existing TP all-reduce contract."""
+    torch.manual_seed(23)
+    x = torch.randn(3, 16)
+    w1 = torch.randn(32, 16)
+    w3 = torch.randn(32, 16)
+    w2 = torch.randn(16, 32)
+    widths = (8, 4, 12, 8)
+
+    full = torch.nn.functional.silu(x @ w1.T) * (x @ w3.T) @ w2.T
+    partials = []
+    offset = 0
+    for width in widths:
+        local = slice(offset, offset + width)
+        partials.append(
+            (torch.nn.functional.silu(x @ w1[local].T) * (x @ w3[local].T))
+            @ w2[:, local].T
+        )
+        offset += width
+
+    assert offset == w1.shape[0]
     torch.testing.assert_close(torch.stack(partials).sum(0), full)
 
 

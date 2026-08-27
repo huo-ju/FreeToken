@@ -118,6 +118,15 @@ def parse_args(
 
         return gpu_arg(value)
 
+    def _positive_float(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a positive number") from exc
+        if number <= 0:
+            raise argparse.ArgumentTypeError("must be > 0")
+        return number
+
     def _gpu_only_layers(value: str) -> int:
         if value.strip().lower() == "auto":
             return -1
@@ -292,6 +301,13 @@ def parse_args(
             "Fraction of total GPU free memory the engine may use for weights + MoE "
             "cache + KV cache combined; the remainder is reserved runtime headroom."
         ),
+    )
+
+    parser.add_argument(
+        "--distributed-timeout",
+        type=_positive_float,
+        default=ServerArgs.distributed_timeout,
+        help="Seconds a TP collective may wait, including asymmetric model startup.",
     )
 
     assert ServerArgs.use_dummy_weight == False
@@ -492,6 +508,26 @@ def parse_args(
             "The MoE backend to use. 'auto' resolves a MoE model to the offload family "
             "(offload, or hybrid when a `ft bench bw` profile recommends it); resident "
             "'fused' experts must be requested explicitly."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-execution-policy",
+        default=ServerArgs.moe_execution_policy,
+        choices=["compatibility", "force_equal_tp", "force_weighted_tp", "force_cpu"],
+        help=(
+            "Experimental unified MoE execution policy. compatibility preserves "
+            "--moe-backend; force_equal_tp uses the existing GPU-shard path and "
+            "force_weighted_tp uses --moe-tp-layout with the same GPU-shard path; "
+            "force_cpu uses the existing rank-local CPU-shard path."
+        ),
+    )
+    parser.add_argument(
+        "--moe-tp-layout",
+        default=ServerArgs.moe_tp_layout,
+        help=(
+            "Startup-only routed-expert TP widths: equal, or comma-separated widths "
+            "such as 512,512,768,256. Experimental DSV4 DS-FP4 safetensors only."
         ),
     )
 
@@ -733,6 +769,36 @@ def parse_args(
     # out of the box (the scheduler resolves the size from free VRAM). Explicit
     # size/rate/auto is preserved.
     from freetoken.moe import is_offload_moe_backend
+
+    execution_policy = kwargs["moe_execution_policy"]
+    if execution_policy == "force_cpu":
+        if kwargs["moe_backend"] not in ("auto", "cpu"):
+            parser.error("--moe-execution-policy force_cpu conflicts with --moe-backend")
+        if kwargs["moe_gpu_only_layers"] > 0:
+            parser.error(
+                "--moe-execution-policy force_cpu conflicts with --moe-gpu-only-layers"
+            )
+        kwargs["moe_backend"] = "cpu"
+        # A forced CPU baseline must not silently retain automatically selected
+        # GPU-permanent layers. If the complete host-shard source does not fit,
+        # startup should reject the baseline as infeasible.
+        kwargs["moe_gpu_only_layers"] = 0
+    elif execution_policy in ("force_equal_tp", "force_weighted_tp"):
+        if kwargs["moe_backend"] not in ("auto", "offload"):
+            parser.error(
+                f"--moe-execution-policy {execution_policy} conflicts with --moe-backend"
+            )
+        if kwargs["moe_cpu_layers"]:
+            parser.error(
+                f"--moe-execution-policy {execution_policy} conflicts with --moe-cpu-layers"
+            )
+        if execution_policy == "force_weighted_tp" and kwargs["moe_tp_layout"] == "equal":
+            parser.error("force_weighted_tp requires an explicit --moe-tp-layout")
+        if execution_policy == "force_equal_tp" and kwargs["moe_tp_layout"] != "equal":
+            parser.error("force_equal_tp requires --moe-tp-layout equal")
+        kwargs["moe_backend"] = "offload"
+    elif kwargs["moe_tp_layout"] != "equal":
+        parser.error("an explicit --moe-tp-layout requires force_weighted_tp")
 
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0

@@ -146,6 +146,12 @@ class OffloadMoeCache:
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
+        # Startup/debug representation of the unified plan policy.  The current
+        # forced adapters still call the proven legacy kernels; later policies
+        # consume the same field without changing compatibility CLI semantics.
+        self.execution_policy = "compatibility"
+        self.plan_epoch = 0
+        self.execution_policy_adapter = None
         # GPU-authoritative layers live in a physically independent immutable
         # allocation.  They never enter slot maps, LRU state, or cache rebuilds.
         self.gpu_resident_layer_ids: frozenset[int] = frozenset()

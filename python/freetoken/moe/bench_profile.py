@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
+from dataclasses import asdict, dataclass
 
 from freetoken.utils import init_logger
 
@@ -29,6 +31,91 @@ _QUANT_TO_BENCH_FORMAT = {
     "bf16": "bf16",
     "fp8_block": "fp8_block",
 }
+
+
+@dataclass(frozen=True)
+class TopologyIdentity:
+    """Stable identity for measurements that must not move between unlike links.
+
+    GPU names are intentionally descriptive only.  PCI address, NUMA placement,
+    negotiated link and software/layout versions form the profile join key.
+    """
+
+    pci_bdf: str
+    numa_node: int
+    pcie_generation: int
+    pcie_width: int
+    gpu_name: str
+    compute_capability: str
+    driver_version: str = "unknown"
+    runtime_version: str = "unknown"
+    tensor_layout: str = "unknown"
+    concurrency: int = 1
+
+    def __post_init__(self) -> None:
+        if not self.pci_bdf:
+            raise ValueError("topology identity requires a PCI BDF")
+        if self.pcie_generation <= 0 or self.pcie_width <= 0:
+            raise ValueError("negotiated PCIe generation and width must be positive")
+        if self.concurrency <= 0:
+            raise ValueError("profile concurrency must be positive")
+
+    def canonical_dict(self) -> dict:
+        return asdict(self)
+
+    def key(self) -> str:
+        raw = json.dumps(self.canonical_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+@dataclass(frozen=True)
+class CostCurvePoint:
+    payload_bytes: int
+    duration_us: float
+    token_count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.payload_bytes < 0 or self.duration_us < 0 or self.token_count <= 0:
+            raise ValueError("cost-curve values must be non-negative and token count positive")
+
+
+def topology_profile_document(
+    identity: TopologyIdentity,
+    *,
+    h2d: tuple[CostCurvePoint, ...] = (),
+    gpu_expert: tuple[CostCurvePoint, ...] = (),
+    cpu_expert: tuple[CostCurvePoint, ...] = (),
+    collective: tuple[CostCurvePoint, ...] = (),
+) -> dict:
+    """Create the versioned, topology-aware portion of a benchmark profile."""
+    return {
+        "schema": "freetoken.moe-cost-profile",
+        "version": 1,
+        "identity": identity.canonical_dict(),
+        "identity_key": identity.key(),
+        "curves": {
+            "h2d": [asdict(point) for point in h2d],
+            "gpu_expert": [asdict(point) for point in gpu_expert],
+            "cpu_expert": [asdict(point) for point in cpu_expert],
+            "collective": [asdict(point) for point in collective],
+        },
+    }
+
+
+def load_topology_profile(identity: TopologyIdentity, path: str | None = None) -> dict | None:
+    """Load an exact topology match; never substitute a same-name GPU."""
+    src = path or os.environ.get("FREETOKEN_BENCHBW_PATH") or default_profile_path()
+    profile = _load(src)
+    if not isinstance(profile, dict):
+        return None
+    if profile.get("schema") == "freetoken.moe-cost-profile":
+        return profile if profile.get("identity_key") == identity.key() else None
+    profiles = profile.get("topology_profiles")
+    if isinstance(profiles, dict):
+        candidate = profiles.get(identity.key())
+        if isinstance(candidate, dict) and candidate.get("identity") == identity.canonical_dict():
+            return candidate
+    return None
 
 
 def _cache_dir() -> str:

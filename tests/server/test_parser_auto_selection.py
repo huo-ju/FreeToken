@@ -135,3 +135,52 @@ def test_moe_placement_budget_flags_parse_auto_and_explicit_values():
     assert explicit.moe_host_budget_gb == 96.0
     assert explicit.moe_pin_budget_gb == 40.5
     assert explicit.moe_placement_policy == "gpu-first"
+
+
+def test_forced_execution_policies_use_legacy_adapters_without_changing_compatibility():
+    config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        compatibility, _ = parse_args(
+            ["--model", ANON_PATH, "--moe-backend", "hybrid"]
+        )
+        gpu, _ = parse_args(
+            ["--model", ANON_PATH, "--moe-execution-policy", "force_equal_tp"]
+        )
+        cpu, _ = parse_args(
+            ["--model", ANON_PATH, "--moe-execution-policy", "force_cpu"]
+        )
+        weighted, _ = parse_args([
+            "--model", ANON_PATH,
+            "--moe-execution-policy", "force_weighted_tp",
+            "--moe-tp-layout", "512,512,768,256",
+            "--distributed-timeout", "1800",
+        ])
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--model", ANON_PATH, "--moe-backend", "hybrid",
+                "--moe-execution-policy", "force_equal_tp",
+            ])
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--model", ANON_PATH, "--moe-execution-policy", "force_cpu",
+                "--moe-gpu-only-layers", "1",
+            ])
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--model", ANON_PATH, "--moe-execution-policy", "force_equal_tp",
+                "--moe-cpu-layers", "1",
+            ])
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--model", ANON_PATH,
+                "--moe-execution-policy", "force_weighted_tp",
+            ])
+
+    assert compatibility.moe_backend == "hybrid"
+    assert compatibility.moe_execution_policy == "compatibility"
+    assert gpu.moe_backend == "offload"
+    assert cpu.moe_backend == "cpu"
+    assert cpu.moe_gpu_only_layers == 0
+    assert weighted.moe_backend == "offload"
+    assert weighted.moe_tp_layout == "512,512,768,256"
+    assert weighted.distributed_timeout == 1800

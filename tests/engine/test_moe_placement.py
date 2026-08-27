@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -9,8 +10,12 @@ from freetoken.engine.moe_placement import (
     ExpertTier,
     MoePlacementInfeasible,
     MoePlacementInputs,
+    NodeMoePlacementInputs,
+    RankTopology,
     plan_moe_placement,
+    plan_node_moe_placement,
 )
+from freetoken.moe.execution_plan import RoutedTpLayout
 
 
 CAPS = ExpertPlacementCapabilities(
@@ -39,6 +44,18 @@ def _inputs(**overrides) -> MoePlacementInputs:
     )
     values.update(overrides)
     return MoePlacementInputs(**values)
+
+
+def _topology(rank: int, *, width: int = 16, vram: int = 24_000) -> RankTopology:
+    return RankTopology(
+        rank=rank,
+        pci_bdf=f"0000:{0x40 + rank:02x}:00.0",
+        numa_node=rank // 2,
+        compute_capability="7.5",
+        vram_bytes=vram,
+        pcie_generation=3,
+        pcie_width=width,
+    )
 
 
 def test_sufficient_host_and_pin_budget_preserves_all_host_authority():
@@ -220,4 +237,90 @@ def test_random_successes_obey_all_capacity_invariants():
             tier is ExpertTier.GPU_PERMANENT
             for layer_id, tier in enumerate(plan.layer_tiers)
             if layer_id in plan.permanent_layer_ids
+        )
+
+
+def test_node_planner_uses_global_budget_instead_of_equal_rank_split():
+    # Rank 0 owns a wider physical shard and legitimately retains three times
+    # as many host bytes.  An old host_budget/tp_size split would force an
+    # unnecessary permanent layer there despite sufficient aggregate RAM.
+    rank0 = _inputs(
+        available_vram_bytes=5_000,
+        host_expert_budget_bytes=0,
+        pin_budget_bytes=0,
+        host_bytes_per_layer=(150,) * 4,
+        gpu_bytes_per_layer=(120,) * 4,
+    )
+    rank1 = _inputs(
+        available_vram_bytes=5_000,
+        host_expert_budget_bytes=0,
+        pin_budget_bytes=0,
+        host_bytes_per_layer=(50,) * 4,
+        gpu_bytes_per_layer=(40,) * 4,
+    )
+    plan = plan_node_moe_placement(
+        NodeMoePlacementInputs(
+            rank_inputs=(rank0, rank1),
+            rank_topology=(_topology(0), _topology(1, width=4)),
+            routed_tp_layout=RoutedTpLayout.equal(1024, 2, alignment=256),
+            host_expert_budget_bytes=800,
+            pin_budget_bytes=800,
+        ),
+        (CAPS, CAPS),
+    )
+
+    assert plan.rank_plans[0].retained_host_bytes == 600
+    assert plan.rank_plans[1].retained_host_bytes == 200
+    assert plan.retained_host_bytes == 800
+    assert plan.rank_plans[0].permanent_layer_ids == ()
+    assert plan.kv_pages == min(rank_plan.kv_pages for rank_plan in plan.rank_plans)
+    plan.verify_checksum()
+
+
+def test_node_plan_checksum_rejects_rank_divergence():
+    inputs = NodeMoePlacementInputs(
+        rank_inputs=(_inputs(), _inputs()),
+        rank_topology=(_topology(0), _topology(1)),
+        routed_tp_layout=RoutedTpLayout.equal(1024, 2, alignment=256),
+        host_expert_budget_bytes=800,
+        pin_budget_bytes=800,
+    )
+    plan = plan_node_moe_placement(inputs, (CAPS, CAPS))
+    with pytest.raises(MoePlacementInfeasible, match="checksum mismatch"):
+        replace(plan, checksum="stale").verify_checksum()
+
+
+def test_node_planner_preserves_forced_policy_constraints_on_every_rank():
+    inputs = NodeMoePlacementInputs(
+        rank_inputs=(_inputs(), _inputs()),
+        rank_topology=(_topology(0), _topology(1)),
+        routed_tp_layout=RoutedTpLayout.equal(1024, 2, alignment=256),
+        host_expert_budget_bytes=800,
+        pin_budget_bytes=0,
+    )
+    plan = plan_node_moe_placement(
+        inputs,
+        (CAPS, CAPS),
+        allow_gpu_permanent=False,
+        explicit_cpu_layer_ids=range(4),
+        allow_additional_cpu_layers=False,
+    )
+    assert all(rank.permanent_layer_ids == () for rank in plan.rank_plans)
+    assert all(rank.cpu_layer_ids == frozenset(range(4)) for rank in plan.rank_plans)
+
+
+def test_weighted_node_layout_rejects_unknown_checkpoint_before_allocation():
+    with pytest.raises(MoePlacementInfeasible, match="safetensors"):
+        plan_node_moe_placement(
+            NodeMoePlacementInputs(
+                rank_inputs=(_inputs(),) * 4,
+                rank_topology=tuple(_topology(rank) for rank in range(4)),
+                routed_tp_layout=RoutedTpLayout.from_widths(
+                    (512, 512, 768, 256), alignment=256
+                ),
+                host_expert_budget_bytes=1_600,
+                pin_budget_bytes=1_600,
+                checkpoint_layout="ftw",
+            ),
+            (CAPS,) * 4,
         )
