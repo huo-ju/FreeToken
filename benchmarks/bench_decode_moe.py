@@ -354,10 +354,10 @@ def _meminfo() -> dict[str, int]:
     return result
 
 
-def _gpu_topology() -> list[dict]:
-    """Best-effort rank identity without importing torch into the client harness."""
+def _gpu_topology(gpu_spec: str | None = None, tp_size: int = 1) -> list[dict]:
+    """Best-effort rank identity in the upstream server's ``--gpu`` order."""
     fields = (
-        "index,name,pci.bus_id,pcie.link.gen.current,pcie.link.width.current,"
+        "index,uuid,name,pci.bus_id,pcie.link.gen.current,pcie.link.width.current,"
         "memory.total,driver_version"
     )
     try:
@@ -368,18 +368,28 @@ def _gpu_topology() -> list[dict]:
         )
     except (OSError, subprocess.SubprocessError):
         return []
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible_order = None if not visible else [value.strip() for value in visible.split(",")]
-    selected = None if visible_order is None else set(visible_order)
+
+    from freetoken.gpu_select import parse_gpu_spec, resolve_gpu_uuids
+
+    try:
+        requested = (
+            parse_gpu_spec(gpu_spec)
+            if gpu_spec
+            else tuple(str(rank) for rank in range(tp_size))
+        )
+        selected = resolve_gpu_uuids(requested) or requested
+    except ValueError:
+        return []
+
     rows = []
     for line in raw.splitlines():
         values = [value.strip() for value in line.split(",")]
-        if len(values) != 7 or (selected is not None and values[0] not in selected):
+        if len(values) != 8:
             continue
-        bdf_parts = values[2].lower().split(":")
+        bdf_parts = values[3].lower().split(":")
         bdf = (
             f"{bdf_parts[-3][-4:]}:{bdf_parts[-2]}:{bdf_parts[-1]}"
-            if len(bdf_parts) >= 3 else values[2].lower()
+            if len(bdf_parts) >= 3 else values[3].lower()
         )
         numa_path = Path("/sys/bus/pci/devices") / bdf / "numa_node"
         try:
@@ -387,22 +397,36 @@ def _gpu_topology() -> list[dict]:
         except (OSError, ValueError):
             numa = -1
         rows.append({
-            "rank": (
-                visible_order.index(values[0]) if visible_order is not None else int(values[0])
-            ),
-            "index": int(values[0]), "name": values[1], "pci_bdf": bdf,
-            "pcie_generation": int(values[3]), "pcie_width": int(values[4]),
-            "memory_total_mib": int(values[5]), "driver_version": values[6],
+            "index": int(values[0]),
+            "uuid": values[1],
+            "name": values[2],
+            "pci_bdf": bdf,
+            "pcie_generation": int(values[4]), "pcie_width": int(values[5]),
+            "memory_total_mib": int(values[6]),
+            "driver_version": values[7],
             "numa_node": numa,
         })
-    return sorted(rows, key=lambda row: row["rank"])
+
+    ordered = []
+    for rank, spec in enumerate(selected):
+        if spec.upper().startswith("GPU-"):
+            matches = [row for row in rows if row["uuid"].upper().startswith(spec.upper())]
+        else:
+            matches = [row for row in rows if row["index"] == int(spec)]
+        if len(matches) == 1:
+            ordered.append({**matches[0], "rank": rank})
+    return ordered
 
 
 class ResourceMonitor:
     """Low-frequency host/link sampler for startup and request peak accounting."""
 
-    def __init__(self, interval_s: float = 1.0):
+    def __init__(
+        self, interval_s: float = 1.0, *, gpu_spec: str | None = None, tp_size: int = 1
+    ):
         self.interval_s = interval_s
+        self.gpu_spec = gpu_spec
+        self.tp_size = tp_size
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.samples = 0
@@ -425,7 +449,7 @@ class ResourceMonitor:
             self.min_swap_free = min(
                 self.min_swap_free, host.get("swapfree_bytes", self.min_swap_free)
             )
-            for gpu in _gpu_topology():
+            for gpu in _gpu_topology(self.gpu_spec, self.tp_size):
                 peak = self.gpus.setdefault(gpu["rank"], dict(gpu))
                 peak["pcie_generation"] = max(
                     peak.get("pcie_generation", 0), gpu["pcie_generation"]
@@ -679,8 +703,8 @@ def run_one(args: argparse.Namespace, backend: str) -> list[dict]:
     fd, log_path = tempfile.mkstemp(prefix=f"bench-serve-{backend}-", suffix=".log")
     cmd = serve_cmd(args, backend, port)
     host_before = _meminfo()
-    topology = _gpu_topology()
-    resource_monitor = ResourceMonitor()
+    topology = _gpu_topology(args.gpu, args.tp_size)
+    resource_monitor = ResourceMonitor(gpu_spec=args.gpu, tp_size=args.tp_size)
     resource_monitor.start()
 
     print(

@@ -1,3 +1,4 @@
+import threading
 from contextlib import contextmanager
 
 import pytest
@@ -824,6 +825,33 @@ def test_requested_residency_routes_layer_settles(monkeypatch):
     settled.clear()
     hb.pin_banks(banks)  # no ambient plan -> every layer pins
     assert settled == ["pin"] * 6
+
+
+def test_pin_pipeline_binds_upstream_rank_device_in_drain_thread(monkeypatch):
+    """cudaHostRegister must not initialize the drain thread's default GPU 0."""
+    import freetoken.moe.host_banks as hb
+
+    events = []
+    bank = object()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_device",
+        lambda device: events.append(("device", device, threading.current_thread().name)),
+    )
+    monkeypatch.setattr(
+        hb,
+        "_settle",
+        lambda settled_bank, residency: events.append(("settle", settled_bank, residency)),
+    )
+
+    with hb.PinPipeline() as pins:
+        pins.submit(bank)
+
+    assert events[0][0:2] == ("device", 3)
+    assert events[0][2] != threading.current_thread().name
+    assert events[1] == ("settle", bank, hb.HostResidency.PINNED.value)
 
 
 def test_echo_residency_stamps_honored_requests_only():

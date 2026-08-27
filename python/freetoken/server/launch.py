@@ -59,7 +59,8 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
 
-    # published (not bound) here: the engine binds it after the allocator setup
+    # Publish without touching CUDA; the engine binds before device-sensitive
+    # probes or allocations.
     from freetoken.gpu_select import set_assigned_gpu
 
     # resolved UUIDs when we have them, the raw --gpu entries when NVML could not resolve them, else one CUDA ordinal per rank

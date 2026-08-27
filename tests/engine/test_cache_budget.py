@@ -452,6 +452,24 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
 
 
+def test_profile_gpu_uses_current_rank_device_and_upstream_uuid(monkeypatch):
+    """Profile selection follows the bound rank and preserves the upstream UUID key."""
+    from freetoken.engine import engine
+
+    calls: list[int] = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(
+        engine,
+        "gpu_identity",
+        lambda index: calls.append(index)
+        or {"name": "rank-local GPU", "uuid": "GPU-rank-3"},
+    )
+
+    assert engine._profile_gpu() == ("rank-local GPU", "GPU-rank-3")
+    assert calls == [3]
+
+
 def test_sm75_auto_ignores_hybrid_bandwidth_recommendation(monkeypatch):
     """A bandwidth-only profile must not select the BF16-only CPU ABI on Turing."""
     from freetoken.engine.engine import _adjust_config

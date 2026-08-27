@@ -11,9 +11,9 @@ on one workload transfers to any model with the same expert format on the same G
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import hashlib
 from dataclasses import asdict, dataclass
 
 from freetoken.utils import init_logger

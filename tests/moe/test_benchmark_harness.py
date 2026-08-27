@@ -29,13 +29,37 @@ def test_eval_plan_case_can_supply_a_reproducible_prompt(tmp_path):
 def test_tp4_server_command_preserves_graph_and_cache_configuration():
     args = _BENCH.parse_args([
         "--model", "/model", "--tp-size", "4", "--cache", "512",
-        "--no-prefill-overlap", "--repetitions", "3",
+        "--gpu", "0,1,2,3", "--no-prefill-overlap", "--repetitions", "3",
     ])
     command = _BENCH.serve_cmd(args, "offload", 19000)
     assert command[command.index("--tp-size") + 1] == "4"
     assert command[command.index("--distributed-timeout") + 1] == "86400"
     assert command[command.index("--moe-cache-size") + 1] == "512"
+    assert command[command.index("--gpu") + 1] == "0,1,2,3"
     assert "--disable-moe-prefill-overlap" in command
+
+
+def test_topology_uses_upstream_gpu_uuid_order(monkeypatch):
+    from freetoken import gpu_select
+
+    monkeypatch.setattr(
+        gpu_select,
+        "resolve_gpu_uuids",
+        lambda specs: ("GPU-b", "GPU-a"),
+    )
+    monkeypatch.setattr(
+        _BENCH.subprocess,
+        "check_output",
+        lambda *args, **kwargs: (
+            "0, GPU-a, A, 00000000:01:00.0, 3, 16, 8192, 600.0\n"
+            "1, GPU-b, B, 00000000:02:00.0, 4, 16, 16384, 600.0\n"
+        ),
+    )
+
+    rows = _BENCH._gpu_topology("1,0", 2)
+
+    assert [row["uuid"] for row in rows] == ["GPU-b", "GPU-a"]
+    assert [row["rank"] for row in rows] == [0, 1]
 
 
 def test_cache_sequence_starts_largest_geometry_with_fixed_kv_capacity():
