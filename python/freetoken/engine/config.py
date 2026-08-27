@@ -27,6 +27,10 @@ class EngineConfig:
     # Startup-only routed-expert TP widths: "equal" or a comma-separated list
     # such as "512,512,768,256". Shared experts remain equal TP.
     moe_tp_layout: str = "equal"
+    # Experimental low-RAM DSV4 source: original safetensors remain authoritative
+    # on disk and one pinned layer-sized staging bank services GPU-cache misses.
+    # The first implementation is forced-TP/eager-only (no graph/prefill overlap).
+    moe_disk_backed: bool = False
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
     nvfp4_backend: str = "triton"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
@@ -37,7 +41,9 @@ class EngineConfig:
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
-    kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Auto-KV floor only. Explicit num_page_override/num_token_override are fixed
+    # hard capacities and do not use this minimum.
+    kv_reserve_tokens: int = 8192
     moe_cache_policy: str = "lru"
     # Startup authoritative-placement policy.  The elastic runtime manager only
     # resizes dynamic/KV pools after this one-shot plan settles.
@@ -89,11 +95,15 @@ class EngineConfig:
     # ratio default above. A runtime cache rebuild sets this (num_swa_pages) to pin the window
     # regardless of the full anchor; the ratio is the startup default and the fallback.
     swa_num_pages_override: int | None = None
-    distributed_timeout: float = 60.0
+    # c10d requires a finite timeout. Use an effectively unbounded default for
+    # multi-rank model startup, where rank-local expert shard sizes may make
+    # progress intentionally asymmetric.
+    distributed_timeout: float = 86400.0
     use_dummy_weight: bool = False
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
-    num_page_override: int | None = None  # if not None, will override the number of pages
+    # Fixed KV capacity. Placement and the runtime pool must use this exact page count.
+    num_page_override: int | None = None
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None

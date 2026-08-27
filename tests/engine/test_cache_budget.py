@@ -21,6 +21,40 @@ def test_moe_priority_fills_experts_up_to_total():
     assert overlap is True
 
 
+def test_default_host_expert_budget_keeps_node_headroom(tmp_path):
+    from freetoken.engine.engine import _default_host_expert_budget_bytes
+
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 131072000 kB\nMemAvailable: 104857600 kB\n")
+    assert _default_host_expert_budget_bytes(meminfo) == 90 * 2**30
+
+
+def test_default_host_expert_budget_fails_closed_without_memavailable(tmp_path):
+    from freetoken.engine.engine import _default_host_expert_budget_bytes
+
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 131072000 kB\n")
+    assert _default_host_expert_budget_bytes(meminfo) == 0
+
+
+def test_fixed_kv_target_uses_intrinsic_pool_floor_not_auto_reserve():
+    from freetoken.engine.engine import _fixed_kv_target_pages
+
+    config = SimpleNamespace(num_page_override=128)
+
+    class Pool:
+        @staticmethod
+        def min_kv_tokens(_config):
+            return 2_048
+
+    # DSV4-style geometry: the intrinsic floor is 16 pages. A much larger
+    # auto-KV reserve is deliberately not an input to this fixed-target check.
+    assert _fixed_kv_target_pages(config, Pool, 128) == 128
+    config.num_page_override = 15
+    with pytest.raises(ValueError, match="minimum 16 pages"):
+        _fixed_kv_target_pages(config, Pool, 128)
+
+
 def test_offload_case_experts_take_most_kv_gets_reserve_floor():
     # budget too small for full residency: experts take what they can, KV keeps its floor.
     size, pages, overlap = plan_cache_budget(

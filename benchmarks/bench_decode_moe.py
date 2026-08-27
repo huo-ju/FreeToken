@@ -47,6 +47,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import signal
 import socket
@@ -111,6 +112,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="routed intermediate widths in TP-rank order, or equal",
     )
     p.add_argument(
+        "--moe-disk-backed",
+        action="store_true",
+        help=(
+            "run the separately labelled bounded-memory DSV4 emergency path; runtime "
+            "checkpoint reads make it ineligible for the normal P3 baseline"
+        ),
+    )
+    p.add_argument(
         "--repetitions", type=int, default=3,
         help="steady-state measured requests per server (default: 3)",
     )
@@ -161,8 +170,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--server-timeout",
         type=float,
-        default=1800,
-        help="seconds to wait for the spawned server to become ready",
+        default=0,
+        help="seconds to wait for server readiness; 0 disables the deadline (default: 0)",
     )
     p.add_argument(
         "--distributed-timeout",
@@ -188,6 +197,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         backend != "offload" for backend in backends
     ):
         p.error("force_equal_tp benchmark rows require --backend offload")
+    if args.moe_disk_backed:
+        if args.execution_policy not in ("force_equal_tp", "force_weighted_tp"):
+            p.error("--moe-disk-backed requires a forced TP execution policy")
+        if not args.no_graph:
+            p.error("--moe-disk-backed requires --no-graph")
+        if not args.no_prefill_overlap:
+            p.error("--moe-disk-backed requires --no-prefill-overlap")
     if args.cache_sequence is not None:
         if any(size <= 0 for size in args.cache_sequence):
             p.error("--cache-sequence values must be positive")
@@ -318,6 +334,8 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
+    if args.moe_disk_backed:
+        cmd.append("--moe-disk-backed")
     if args.no_prefill_overlap:
         cmd.append("--disable-moe-prefill-overlap")
     if args.num_tokens is not None:
@@ -340,6 +358,39 @@ def _git_commit() -> str:
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+
+
+def _placement_log_metadata(log_path: str) -> dict:
+    """Extract durable placement/storage facts from the completed server log."""
+    try:
+        log = Path(log_path).read_text(errors="replace")
+    except OSError:
+        return {}
+    checksum = re.search(r"MoE authoritative placement \(checksum ([0-9a-f]+)\)", log)
+    mode = re.search(r"^\s*mode:\s*(.+)$", log, flags=re.MULTILINE)
+    kv = re.search(r"^\s*KV:\s*(.+)$", log, flags=re.MULTILINE)
+    disk = re.search(
+        r"MoE disk refill telemetry: reads=(\d+) experts=(\d+) bytes=(\d+) "
+        r"seconds=([0-9.]+)",
+        log,
+    )
+    result = {
+        "placement_checksum": checksum.group(1) if checksum else None,
+        "placement_mode": mode.group(1).strip() if mode else None,
+        "kv_plan": kv.group(1).strip() if kv else None,
+        "runtime_expert_disk_reads": 0,
+        "disk_refill_experts": 0,
+        "disk_refill_bytes": 0,
+        "disk_refill_seconds": 0.0,
+    }
+    if disk:
+        result.update(
+            runtime_expert_disk_reads=int(disk.group(1)),
+            disk_refill_experts=int(disk.group(2)),
+            disk_refill_bytes=int(disk.group(3)),
+            disk_refill_seconds=float(disk.group(4)),
+        )
+    return result
 
 
 def _meminfo() -> dict[str, int]:
@@ -481,8 +532,8 @@ def die_with_log(msg: str, log_path: str) -> None:
 
 
 def wait_ready(origin: str, proc: subprocess.Popen, log_path: str, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    deadline = None if timeout <= 0 else time.monotonic() + timeout
+    while deadline is None or time.monotonic() < deadline:
         if proc.poll() is not None:
             die_with_log(f"server exited with code {proc.returncode} during startup", log_path)
         try:
@@ -637,6 +688,10 @@ def _summarize_measurements(
         "model": args.model,
         "backend": backend,
         "tp_size": args.tp_size,
+        "execution_policy": args.execution_policy,
+        "moe_tp_layout": args.moe_tp_layout,
+        "moe_disk_backed": args.moe_disk_backed,
+        "memory_ratio": args.mem_ratio,
         "moe_cache_size": cache_size,
         "kv_token_override": args.num_tokens,
         "problem": args.problem,
@@ -667,6 +722,7 @@ def _summarize_measurements(
         "output_sha1": hashlib.sha1(result["text"].encode()).hexdigest()[:12],
         "runs": runs,
         "server_log": server_log,
+        **_placement_log_metadata(server_log),
     }
 
     print(

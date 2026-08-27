@@ -1,12 +1,13 @@
 # MoE 异构混合执行分阶段实施计划
 
-> 状态：实施中（P0 基线与 P1–P2 公共契约首批代码已落地）
-> 记录日期：2026-08-24
-> 目标分支：`work/moe-heterogeneous-execution`
+> 状态：实施中（P0 基线、P1–P2 公共契约及 P3 weighted TP 已落地；目标平台 P3 实机验收通过）
+> 记录日期：2026-08-27
+> 目标分支：`work/moe-heterogeneous-upstream-merge`
 > 首个目标平台：4 × NVIDIA TITAN RTX（SM75）单机，DeepSeek-V4-Flash-0731
 > 相关文档：
 > [异构 PCIe 环境下的 MoE 并行与专家执行设计](moe-heterogeneous-pcie-parallelism-design.md)、
 > [MoE 多层资源管理与弹性 Placement 改造计划](moe-resource-placement-plan.md)、
+> [MoE VRAM + RAM 联合 Placement 修正计划](moe-vram-ram-placement-correction-plan.md)、
 > [FreeToken 论文](https://arxiv.org/abs/2608.16157)
 
 ## 1. 执行摘要
@@ -920,7 +921,7 @@ pipeline。这样可以最早验证统一架构是否成立，同时把高风险
   route overlap、fixed-buffer replay 和 telemetry accounting 的 CPU-only 测试。
 
 验证结果：使用 `/home/huoju/work/freetoken-triton-turing-work/.venv` 和本 worktree 的
-`PYTHONPATH` 运行全仓测试，结果为 `1446 passed, 25 skipped`。
+`PYTHONPATH` 运行全仓测试，当前结果为 `1480 passed, 25 skipped`。
 
 P0 实测基线：
 
@@ -991,24 +992,68 @@ deprecation warning）。
 真实 checkpoint 验收记录：
 
 - 复用 P0 的 equal TP4/16K/cache768/overlap-off 基线，不重跑 equal server；
-- 对 weighted `512,512,768,256` 做了两次 startup 尝试，均在 expert bank allocation
+- 对 weighted `512,512,768,256` 的早期 startup 尝试曾在 expert bank allocation
   前由 node capacity proof 拒绝，没有进入 CUDA Graph capture 或 decode；
 - 第一次暴露出 host budget 在 resident-weight 临时加载峰值期间采样的问题；已改为所有
   rank 在任何权重 materialization 前同步采样一次，消除 rank timing 不确定性；
-- 修复后仍只得到 36.48 GiB 默认 host expert budget，而 weighted routed banks 需要
-  51.40 GiB aggregate；planner 因此尝试 15.54 GiB/rank permanent placement，并因
-  dynamic-cache/KV floor 还差 2.23 GiB/rank 而正确 fail-fast；
-- 已停止继续加载模型。下一次验收前先解决默认 host-budget 与这台 123 GiB 节点实际
-  稳态可用容量之间的口径差异，或显式给出经确认的 `--moe-host-budget-gb`，不能靠反复
-  startup 试错。
+- 曾尝试以完整 distributed host banks 作为未显式配置时的兼容预算，从而越过旧的
+  36.48 GiB capacity blocker；一次长启动中 rank 0 完成 43/43 expert shards，其他
+  ranks 到达约 34/43，随后主机/进程退出；
+- 2026-08-27 在禁用短 readiness timeout、将 process-group timeout 放宽到 24 小时后，
+  只启动一次相同 weighted 验收。planner 放行了 137.06 GiB aggregate host banks；加载到
+  最窄 rank 41/43、其余 ranks 约 26/43 时，内核 OOM killer 终止任务。systemd 记录该
+  scope 内存峰值 119.5 GiB、swap 峰值 1.9 GiB；无 Python traceback、collective timeout、
+  GPU Xid 或主机重启，因此中断原因确认为 host OOM；
+- 默认预算现改为 expert allocation 前各 rank 的 `MemAvailable` 减去
+  `max(8 GiB, 10%)` node reserve，并取全 rank 观测下界；无法读取容量时按零预算安全
+  失败。显式 `--moe-host-budget-gb` 仍按用户给定的硬预算执行；
+- RAM 无法扩容，因此增加了一个保持 P2 简单的实验性 `--moe-disk-backed` 路径：原始
+  safetensors 是 routed experts 的权威存储，每个 TP rank 只分配并 pin 一个逻辑层大小的
+  staging bank；GPU LRU miss 时只将所需 expert 的 rank-local slice 读入 staging，再复用
+  现有 row-copy kernel。weighted `512,512,768,256` 的 staging 分别为
+  `0.797/0.797/1.195/0.398 GiB`，合计 `3.188 GiB`，不再分配 137.06 GiB 完整 host banks；
+- 首版有意限制为 forced equal/weighted TP、原始 DSV4 DS-FP4 checkpoint、eager execution
+  (`--cuda-graph-max-bs 0`) 且关闭 prefill overlap。所有逻辑层复用同一 staging，因此每次
+  miss H2D 后同步当前 stream，先保证正确性和有界内存，不引入 ring buffer、后台 I/O、
+  telemetry 或自动策略；预期性能显著低于完整 host banks；
+- 2026-08-27 只加载一次真实 checkpoint 做 smoke：TP4、16K KV、cache768、上述 weighted
+  layout 在约 30 秒内进入 serving，planner 报告 3.19 GiB aggregate staging；两个 18-token
+  prefill 请求均返回 HTTP 200，输入吞吐分别约 0.13 和 0.18 token/s，随后 server 正常关停，
+  四卡显存均回到 1 MiB、host available 回到约 109 GiB。说明内存与运行时 miss 路径成立，
+  但性能不适合正式使用；本次将 `--decode` 设为 2，detokenizer 把输出合并成单个 SSE event，
+  benchmark 因无法形成两个计时点而未写 JSON，这不是模型或 server 失败。后续计时 smoke
+  至少使用 8 个 decode token；
+- 随后复用既有 equal-TP 的同 prompt/greedy/16-token 样本做判别验证。weighted
+  disk-backed 连续两次生成完全相同的文本与 SHA1 `89d67704f64f...`，证明重复 staging
+  refill 具有确定性，但与旧 equal SHA1 `bbf46f95dcfb...` 不同；为隔离原因，disk-backed
+  开关最小放宽到 `force_equal_tp`，只加载一次 equal disk-backed 模型，同一请求精确复现
+  旧 equal 文本和 SHA1。因此 safetensors reader、bounded staging、cache miss copy 均通过
+  equal 基线，weighted 分叉来自不同 intermediate 分片宽度造成的 FP16 local partial/
+  all-reduce 求和分组变化。两种输出语义一致，现有 kernel reference 仍按数值容差验收；
+  不为逐 token hash 相等引入额外通信或改变默认精度；
+- 上游 GPU selection 合并后，TP rank 按 `--gpu` 列表顺序分配，并通过物理 UUID 映射到
+  worker 的 CUDA visible ordinal；weighted TP、node planner 和 DSV4 slice 主体未被替换。
 
-尚未达到 P3 完整退出条件：
+P3 目标平台验收结果：
 
-- 需要在明确验收点仅加载一次 checkpoint，使用固定 16K KV 和同一个简单 eval case，
-  对比 `force_equal_tp` 与 `force_weighted_tp` 的输出及端到端性能；
-- 当前明确阻塞项是默认 node host-budget 口径：P0 已证明 equal 配置可在该节点保留完整
-  host banks（运行期最低 MemAvailable 约 8.83 GiB），但新 planner 在 TP worker 启动后
-  只证明出 36.48 GiB，低于 51.40 GiB weighted bank aggregate；
-- 尚未完成真实 CUDA Graph capture/replay、cold/warm cache、prefill/decode 的 weighted
-  集成验证，因此当前实现保持 experimental forced action，不进入 auto 候选集；
-- P4 的 resident EP/full-owner route 仍未开始。
+- 修正后的首次 C4 命令在 expert allocation 前被错误的 fixed/auto KV floor 比较拒绝
+  （fixed 128 pages 被与 auto reserve 485 pages 比较）。现已改为使用 pool intrinsic floor
+  16 pages并补回归；经明确授权后只重试一次同参数 checkpoint；
+- no-disk `force_weighted_tp` 使用 layout `512,512,768,256`、fixed 16K KV、cache 768、
+  overlap off 和 CUDA Graph on 成功进入 serving。node-global solver 在 90.62 GiB safe host
+  budget 下选择 `15/15/8/33` 个 rank-local permanent layers，retained host 90.45 GiB、
+  permanent GPU 46.62 GiB，checksum 为 `f9a46cd7d37a`；runtime residency 校验通过；
+- plan 和 runtime cache geometry 均为 128 pages / 16384 tokens；三次 measured greedy 输出
+  SHA1 均为 `3cc47752354e`，runtime expert disk read/refill 为 0，swap 无增长，未发生 OOM、
+  timeout 或 Xid，CUDA Graph capture/replay 正常；
+- weighted 三次中位数为 10.742 tok/s、93.097 ms/token、TTFT 2.243 s、event p99
+  143.852 ms。相对同配置 no-disk equal baseline 的 7.523 tok/s、132.918 ms/token、
+  TTFT 2.717 s、event p99 204.869 ms，吞吐提升 42.77%，TTFT 降低 17.42%，p99 降低
+  29.78%，达到进入 auto 候选集所需的性能门槛；
+- 原始 JSON 为
+  `benchmarks/results/moe-placement-c4-20260827/weighted-tp4-cache768-kv16k.jsonl`，server log
+  为 `/tmp/bench-serve-offload-6g6nqfyk.log`；完整 placement 表、资源最低点和首次校验失败
+  记录见 placement 修正计划；
+- disk-backed eager 的 cold prefill、重复 cache refill、equal baseline 仍只记作 bounded-memory
+  emergency smoke，不是 weighted TP 容量或性能退出条件，也不进入 auto 候选集；
+- P4 的真实 GPU/CPU shard mixed worklist 尚未开始；resident EP/full-owner 属于 P5。

@@ -121,6 +121,85 @@ def test_dsv4_weighted_tp_placement_uses_layout_offsets():
     )
 
 
+def test_dsv4_disk_source_reuses_one_layer_staging_bank(monkeypatch):
+    import freetoken.distributed.info as info
+    import freetoken.models.deepseek_v4.weight as weight
+    from freetoken.distributed import DistributedInfo
+    from freetoken.models.deepseek_v4.args import DeepseekV4Args
+
+    monkeypatch.setattr(info, "_TP_INFO", DistributedInfo(rank=2, size=4))
+    calls = []
+
+    class FakeReader:
+        def __init__(self, *_args):
+            pass
+
+        def has(self, _name):
+            return True
+
+        def get(self, name):
+            calls.append(name)
+            proj, kind = name.rsplit(".", 2)[-2:]
+            h, intermediate = 64, 1024
+            if proj in ("w1", "w3"):
+                shape = (
+                    (intermediate, h // 2)
+                    if kind == "weight"
+                    else (intermediate, h // 32)
+                )
+            else:
+                shape = (
+                    (h, intermediate // 2)
+                    if kind == "weight"
+                    else (h, intermediate // 32)
+                )
+            dtype = torch.uint8 if kind == "weight" else torch.float8_e8m0fnu
+            return torch.zeros(shape, dtype=dtype)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(weight, "_weight_map", lambda _path: {})
+    monkeypatch.setattr(weight, "_ShardReader", FakeReader)
+    args = DeepseekV4Args(
+        n_layers=2,
+        n_routed_experts=2,
+        dim=64,
+        moe_inter_dim=1024,
+        compress_ratios=(0, 0),
+    )
+    source = weight.Dsfp4DiskExpertSource(
+        "/checkpoint",
+        args,
+        routed_tp_widths=(256, 256, 256, 256),
+        pin=False,
+    )
+
+    assert all(per_layer[0] is per_layer[1] for per_layer in source.sources.values())
+    assert source.staging_bytes == sum(
+        tensor.element_size() * tensor.numel()
+        for tensor in (per_layer[0] for per_layer in source.sources.values())
+    )
+    assert source.load_rows(1, [1, 1]) == 6
+    assert calls == [
+        f"layers.1.ffn.experts.1.{proj}.{kind}"
+        for proj in ("w1", "w2", "w3")
+        for kind in ("weight", "scale")
+    ]
+    assert source.expert_bytes_per_slot * source.num_experts == source.staging_bytes
+    assert source.stats()["runtime_expert_disk_reads"] == 1
+    assert source.stats()["disk_refill_experts"] == 1
+    assert source.stats()["disk_refill_bytes"] > 0
+    assert source.stats()["disk_refill_seconds"] >= 0
+    source.reset_stats()
+    assert source.stats() == {
+        "runtime_expert_disk_reads": 0,
+        "disk_refill_experts": 0,
+        "disk_refill_bytes": 0,
+        "disk_refill_seconds": 0.0,
+    }
+
+
 def test_dsv4_tp4_vocab_and_shared_expert_storage_are_sharded(monkeypatch):
     import freetoken.distributed.info as info
     from freetoken.distributed import DistributedInfo
@@ -368,6 +447,55 @@ def test_gpu_only_store_is_physically_separate_and_survives_dynamic_rebuild():
     assert tuple(view.data_ptr() for view in rebuilt_views) == permanent_ptrs
     torch.testing.assert_close(rebuilt_views[0], resident["gate_up"])
     torch.testing.assert_close(rebuilt_views[1], resident["down"])
+    assert cache.decode_miss_stats()["runtime_expert_disk_reads"] == 0
+
+
+def test_rank_local_caches_accept_different_authoritative_tiers_for_same_layer():
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    experts, layers = 2, 3
+    specs = {
+        "gate_up": ((experts, 4, 3), torch.float16),
+        "down": ((experts, 3, 2), torch.float16),
+    }
+
+    def build(permanent_ids):
+        cache = OffloadMoeCache(
+            num_layers=layers,
+            num_experts=experts,
+            cache_size=experts,
+            device=torch.device("cpu"),
+            prefill_overlap=False,
+        )
+        cache.prepare_gpu_resident_layers(specs, permanent_ids)
+        sources = {
+            name: [torch.full(shape, layer + 1, dtype=dtype) for layer in range(layers)]
+            for name, (shape, dtype) in specs.items()
+        }
+        for layer in permanent_ids:
+            cache.stage_gpu_resident_layer(
+                layer, {name: per_layer[layer] for name, per_layer in sources.items()}
+            )
+        residency = [HostResidency.PINNED.value] * layers
+        for layer in permanent_ids:
+            residency[layer] = HostResidency.GPU_ONLY.value
+        cache.set_bank_sources(sources, layer_residency=residency)
+        return cache
+
+    rank0 = build((1,))
+    rank1 = build((2,))
+
+    assert rank0.is_gpu_resident_layer(1)
+    assert not rank1.is_gpu_resident_layer(1)
+    assert rank0.bank_sources["gate_up"][1] is None
+    assert rank1.bank_sources["gate_up"][1] is not None
+    assert rank0.slot_for_id[1].tolist() == [-1, -1]
+    assert rank1.slot_for_id[1].tolist() == [-1, -1]
+
+    ids = torch.tensor([[1, 0]], dtype=torch.int32)
+    rank0.map_gpu_resident_experts(1, ids)
+    assert ids.tolist() == [[1, 0]]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

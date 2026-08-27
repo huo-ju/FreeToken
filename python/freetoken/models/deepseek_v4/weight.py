@@ -13,6 +13,7 @@ import collections
 import json
 import os
 import re
+import time
 from typing import Iterator
 
 import safetensors
@@ -442,11 +443,13 @@ def _place_dsfp4(
     tp_rank: int = 0,
     tp_size: int = 1,
     routed_tp_widths: tuple[int, ...] | None = None,
+    bank_layer_id: int | None = None,
 ) -> int:
     """Copy one expert tensor into its layer/expert slot (shared by serial + parallel
     readers): w1->gate_up[:,:I], w3->gate_up[:,I:], w2->down. Returns the layer index."""
     m = _EXPERT_RE.match(name)
     layer, expert = int(m.group("layer")), int(m.group("expert"))
+    destination_layer = layer if bank_layer_id is None else bank_layer_id
     proj, kind = m.group("proj"), m.group("kind")
     # The serving bank specs validate the production 256-value tile.  Keep the
     # low-level placement helper geometry-neutral for tiny loader unit fixtures.
@@ -462,19 +465,116 @@ def _place_dsfp4(
     if kind == "weight":
         t = t.view(torch.uint8)
         if proj == "w1":
-            banks["gate_up_packed"][layer][expert, :local_i] = t[i0:i1]
+            banks["gate_up_packed"][destination_layer][expert, :local_i] = t[i0:i1]
         elif proj == "w3":
-            banks["gate_up_packed"][layer][expert, local_i:] = t[i0:i1]
+            banks["gate_up_packed"][destination_layer][expert, local_i:] = t[i0:i1]
         else:  # w2 -> down
-            banks["down_packed"][layer][expert] = t[:, i0 // 2:i1 // 2]
+            banks["down_packed"][destination_layer][expert] = t[:, i0 // 2:i1 // 2]
     else:  # scale (e8m0)
         if proj == "w1":
-            banks["gate_up_scale"][layer][expert, :local_i] = t[i0:i1]
+            banks["gate_up_scale"][destination_layer][expert, :local_i] = t[i0:i1]
         elif proj == "w3":
-            banks["gate_up_scale"][layer][expert, local_i:] = t[i0:i1]
+            banks["gate_up_scale"][destination_layer][expert, local_i:] = t[i0:i1]
         else:
-            banks["down_scale"][layer][expert] = t[:, i0 // 32:i1 // 32]
+            banks["down_scale"][destination_layer][expert] = t[:, i0 // 32:i1 // 32]
     return layer
+
+
+class Dsfp4DiskExpertSource:
+    """Original-safetensors source with one bounded pinned staging layer."""
+
+    def __init__(
+        self,
+        model_path: str,
+        args: DeepseekV4Args,
+        *,
+        routed_tp_widths: tuple[int, ...],
+        pin: bool = True,
+    ) -> None:
+        from freetoken.moe.host_banks import alloc_banks
+
+        self.args = args
+        self.routed_tp_widths = tuple(routed_tp_widths)
+        self.num_layers = args.n_layers
+        self.num_experts = args.n_routed_experts
+        self._tp = get_tp_info()
+        specs = dsfp4_expert_bank_specs(
+            args, routed_tp_widths=self.routed_tp_widths
+        )
+        self._host_banks = alloc_banks(specs)
+        if pin:
+            for bank in self._host_banks.values():
+                bank.pin()
+        self._banks = {
+            name: [bank.tensor] for name, bank in self._host_banks.items()
+        }
+        # OffloadMoeCache expects one tensor per logical layer. They deliberately
+        # alias the same staging storage; load_rows refreshes it before every miss copy.
+        self.sources = {
+            name: [bank.tensor] * self.num_layers
+            for name, bank in self._host_banks.items()
+        }
+        self.staging_bytes = sum(bank.nbytes for bank in self._host_banks.values())
+        self.expert_bytes_per_slot = self.staging_bytes // self.num_experts
+        self.disk_refill_calls = 0
+        self.disk_refill_experts = 0
+        self.disk_refill_bytes = 0
+        self.disk_refill_seconds = 0.0
+        self._reader = _ShardReader(model_path, _weight_map(model_path), "cpu")
+
+    def load_rows(self, layer_id: int, expert_ids: list[int] | tuple[int, ...]) -> int:
+        if not 0 <= layer_id < self.num_layers:
+            raise ValueError(f"DSV4 disk source layer {layer_id} is out of range")
+        experts = tuple(dict.fromkeys(int(expert) for expert in expert_ids))
+        if any(expert < 0 or expert >= self.num_experts for expert in experts):
+            raise ValueError(f"DSV4 disk source expert ids are out of range: {experts}")
+        started = time.perf_counter()
+        placed = 0
+        loaded_bytes = 0
+        for expert in experts:
+            for proj in ("w1", "w2", "w3"):
+                for kind in ("weight", "scale"):
+                    name = (
+                        f"layers.{layer_id}.ffn.experts.{expert}."
+                        f"{proj}.{kind}"
+                    )
+                    if not self._reader.has(name):
+                        raise KeyError(f"checkpoint is missing routed expert tensor {name!r}")
+                    tensor = self._reader.get(name)
+                    loaded_bytes += tensor.numel() * tensor.element_size()
+                    _place_dsfp4(
+                        self._banks,
+                        name,
+                        tensor,
+                        self.args.moe_inter_dim,
+                        tp_rank=self._tp.rank,
+                        tp_size=self._tp.size,
+                        routed_tp_widths=self.routed_tp_widths,
+                        bank_layer_id=0,
+                    )
+                    placed += 1
+        self.disk_refill_calls += 1
+        self.disk_refill_experts += len(experts)
+        self.disk_refill_bytes += loaded_bytes
+        self.disk_refill_seconds += time.perf_counter() - started
+        return placed
+
+    def reset_stats(self) -> None:
+        self.disk_refill_calls = 0
+        self.disk_refill_experts = 0
+        self.disk_refill_bytes = 0
+        self.disk_refill_seconds = 0.0
+
+    def stats(self) -> dict[str, int | float]:
+        return {
+            "runtime_expert_disk_reads": self.disk_refill_calls,
+            "disk_refill_experts": self.disk_refill_experts,
+            "disk_refill_bytes": self.disk_refill_bytes,
+            "disk_refill_seconds": self.disk_refill_seconds,
+        }
+
+    def close(self) -> None:
+        self._reader.close()
 
 
 def load_dsfp4_expert_sources_parallel(
@@ -522,6 +622,7 @@ def load_dsfp4_expert_sources_parallel(
 
 
 __all__ = [
+    "Dsfp4DiskExpertSource",
     "iter_weights",
     "load_dsfp4_expert_sources",
     "load_dsfp4_expert_sources_parallel",

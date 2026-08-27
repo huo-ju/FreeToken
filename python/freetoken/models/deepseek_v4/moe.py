@@ -118,8 +118,11 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
         # streaming buffers disown their borrowed slots on invalidation.
         # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
         if (
-            hidden_states.shape[0] * self.top_k >= self.num_experts
-            or cache.is_unpinned_layer(self.layer_id)
+            cache.bounded_source is None
+            and (
+                hidden_states.shape[0] * self.top_k >= self.num_experts
+                or cache.is_unpinned_layer(self.layer_id)
+            )
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot

@@ -211,6 +211,9 @@ class OffloadMoeCache:
         self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor | None]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
+        # Optional low-RAM source that refreshes aliased staging rows from disk
+        # immediately before a scheduled GPU-cache miss copy.
+        self.bounded_source = None
         # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
@@ -433,6 +436,29 @@ class OffloadMoeCache:
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
+
+    def set_bounded_source(self, source) -> None:
+        """Attach a source that materializes scheduled rows into host staging.
+
+        The ordinary bank/copy ABI remains unchanged: ``source.sources`` has one
+        tensor per logical layer, but every entry aliases bounded staging storage.
+        """
+        if self.bounded_source is not None:
+            raise RuntimeError("bounded expert source is already attached")
+        self.bounded_source = source
+
+    def close_bounded_source(self) -> None:
+        source, self.bounded_source = self.bounded_source, None
+        if source is not None:
+            stats = source.stats()
+            logger.info(
+                "MoE disk refill telemetry: "
+                f"reads={stats['runtime_expert_disk_reads']} "
+                f"experts={stats['disk_refill_experts']} "
+                f"bytes={stats['disk_refill_bytes']} "
+                f"seconds={stats['disk_refill_seconds']:.6f}"
+            )
+            source.close()
 
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
@@ -993,6 +1019,8 @@ class OffloadMoeCache:
         self.stat_active_layer.zero_()
         self.stat_fetched_layer.zero_()
         self.stat_steps_layer.zero_()
+        if self.bounded_source is not None:
+            self.bounded_source.reset_stats()
 
     def record_decode_stats(self, layer_id: int) -> None:
         """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
@@ -1026,7 +1054,7 @@ class OffloadMoeCache:
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
         fetched = int(self.stat_fetched.item())
-        return {
+        result = {
             "layer_calls": calls,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
@@ -1040,6 +1068,16 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
+        if self.bounded_source is None:
+            result.update(
+                runtime_expert_disk_reads=0,
+                disk_refill_experts=0,
+                disk_refill_bytes=0,
+                disk_refill_seconds=0.0,
+            )
+        else:
+            result.update(self.bounded_source.stats())
+        return result
 
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.
@@ -1108,6 +1146,18 @@ class OffloadMoeCache:
         if self.is_gpu_resident_layer(layer_id):
             # Permanent rows never enter the pending dynamic-copy state.
             return
+        if self.bounded_source is not None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "disk-backed expert misses cannot execute inside a CUDA Graph"
+                )
+            # Eager-only by contract: synchronize the small miss descriptor, fill
+            # the corresponding staging rows from mmap-backed safetensors, then
+            # reuse the existing row-copy kernels below.
+            count = int(self.num_indices.item())
+            if count:
+                experts = self.src_indices[:count].to("cpu").tolist()
+                self.bounded_source.load_rows(layer_id, experts)
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
                 raise RuntimeError(
@@ -1137,6 +1187,11 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+            if self.bounded_source is not None:
+                # Every logical layer aliases the same host staging bank.  Do not
+                # let the CPU refill it for the next layer until this DMA has
+                # consumed the current rows.
+                torch.cuda.current_stream(self.device).synchronize()
             return
 
         from freetoken.kernel import fast_index_copy_jit
@@ -1151,6 +1206,8 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+        if self.bounded_source is not None:
+            torch.cuda.current_stream(self.device).synchronize()
 
 
 def iter_offload_moe_layers(model) -> Iterator:

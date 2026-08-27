@@ -530,6 +530,18 @@ def parse_args(
             "such as 512,512,768,256. Experimental DSV4 DS-FP4 safetensors only."
         ),
     )
+    parser.add_argument(
+        "--moe-disk-backed",
+        action="store_true",
+        default=ServerArgs.moe_disk_backed,
+        help=(
+            "Emergency/diagnostic DSV4 forced-TP low-RAM source: runtime cache misses "
+            "read expert tensors from the original checkpoint and throughput may be unusable. "
+            "Uses a bounded pinned staging bank. "
+            "Requires force_equal_tp or force_weighted_tp, --cuda-graph-max-bs 0 and "
+            "--disable-moe-prefill-overlap."
+        ),
+    )
 
     parser.add_argument(
         "--nvfp4-backend",
@@ -581,7 +593,10 @@ def parse_args(
         "--kv-reserve-tokens",
         type=int,
         default=ServerArgs.kv_reserve_tokens,
-        help="KV-cache token floor reserved before --moe-cache-auto fills experts.",
+        help=(
+            "Minimum KV-cache tokens only when KV capacity is auto-selected; ignored by "
+            "fixed --num-tokens/--num-pages."
+        ),
     )
 
     parser.add_argument(
@@ -799,6 +814,14 @@ def parse_args(
         kwargs["moe_backend"] = "offload"
     elif kwargs["moe_tp_layout"] != "equal":
         parser.error("an explicit --moe-tp-layout requires force_weighted_tp")
+
+    if kwargs["moe_disk_backed"]:
+        if execution_policy not in ("force_equal_tp", "force_weighted_tp"):
+            parser.error("--moe-disk-backed requires a forced TP execution policy")
+        if kwargs["cuda_graph_max_bs"] != 0:
+            parser.error("--moe-disk-backed requires --cuda-graph-max-bs 0")
+        if kwargs["moe_prefill_overlap"]:
+            parser.error("--moe-disk-backed requires --disable-moe-prefill-overlap")
 
     _no_cache_flag = (
         kwargs["moe_cache_size"] == 0

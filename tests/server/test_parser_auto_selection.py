@@ -178,9 +178,41 @@ def test_forced_execution_policies_use_legacy_adapters_without_changing_compatib
 
     assert compatibility.moe_backend == "hybrid"
     assert compatibility.moe_execution_policy == "compatibility"
+    assert compatibility.distributed_timeout == 86400
     assert gpu.moe_backend == "offload"
     assert cpu.moe_backend == "cpu"
     assert cpu.moe_gpu_only_layers == 0
     assert weighted.moe_backend == "offload"
     assert weighted.moe_tp_layout == "512,512,768,256"
     assert weighted.distributed_timeout == 1800
+
+
+def test_disk_backed_moe_requires_explicit_eager_forced_tp_mode():
+    config = _Config({"architectures": ["DeepseekV4ForCausalLM"], "torch_dtype": "bfloat16"})
+    valid = [
+        "--model", ANON_PATH,
+        "--moe-execution-policy", "force_weighted_tp",
+        "--moe-tp-layout", "512,512,768,256",
+        "--moe-disk-backed",
+        "--cuda-graph-max-bs", "0",
+        "--disable-moe-prefill-overlap",
+    ]
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        args, _ = parse_args(valid)
+        equal, _ = parse_args([
+            "--model", ANON_PATH,
+            "--moe-execution-policy", "force_equal_tp",
+            "--moe-disk-backed",
+            "--cuda-graph-max-bs", "0",
+            "--disable-moe-prefill-overlap",
+        ])
+        with pytest.raises(SystemExit):
+            parse_args(valid[:-3])
+        with pytest.raises(SystemExit):
+            parse_args(valid[:-2])
+
+    assert args.moe_disk_backed is True
+    assert equal.moe_disk_backed is True
+    assert equal.moe_tp_layout == "equal"
+    assert args.cuda_graph_max_bs == 0
+    assert args.moe_prefill_overlap is False

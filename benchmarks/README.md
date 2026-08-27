@@ -50,6 +50,11 @@ python benchmarks/bench_decode_moe.py \
 
 Weighted TP currently accepts only original DSV4 DS-FP4 safetensors. It rejects
 FTW banks before expert allocation because those banks encode the older TP1 layout.
+The P3 capacity/performance baseline above intentionally does not use
+`--moe-disk-backed`: normal startup must prove a joint VRAM+RAM placement with zero
+runtime checkpoint reads. `--moe-disk-backed --no-graph --no-prefill-overlap` remains
+available only as a separately labelled low-memory emergency/diagnostic run; its results
+must not be mixed into the P3 baseline.
 
 **`bench_load_weight_generic.py`** — expert-bank load time: serial vs parallel O_DIRECT
 vs pre-repacked FTW, each mode in its own subprocess. Linux-only; stages the FTW under
