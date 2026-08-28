@@ -303,7 +303,10 @@ class Scheduler(SchedulerIOMixin):
         if last_data is None:
             return
 
-        batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
+        batch, (_, next_tokens_cpu, copy_done, length_finished) = (
+            last_data[0].batch,
+            last_data[1],
+        )
         copy_done.synchronize()
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
@@ -339,7 +342,7 @@ class Scheduler(SchedulerIOMixin):
                 next_token = int(next_token.item())
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
-                hit_length = not req.can_decode
+                hit_length = length_finished[i]
                 hit_eos = (
                     not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
                 )
@@ -395,6 +398,11 @@ class Scheduler(SchedulerIOMixin):
         swa_tokens = self._swa_token_usage()
         if reply:
             mem = self._gpu_mem_bytes()
+            moe_telemetry = (
+                self._collect_moe_telemetry()
+                if any(message.finished for message in reply)
+                else None
+            )
             mamba_used, mamba_total = mamba_slots or (0, 0)
             swa_used, swa_total = swa_tokens or (0, 0)
             for m in reply:
@@ -405,6 +413,8 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                if m.finished:
+                    m.moe_telemetry = moe_telemetry
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -473,6 +483,33 @@ class Scheduler(SchedulerIOMixin):
         if self.device.type != "cuda":
             return 0
         return torch.cuda.memory_reserved(self.device)
+
+    def _collect_moe_telemetry(self) -> dict | None:
+        """Read counters once and require a coherent snapshot from every TP rank."""
+        cache = getattr(self.engine, "moe_offload_cache", None)
+        if cache is None or not (
+            self.config.moe_collect_stats or self.config.moe_collect_timing
+        ):
+            return None
+        node_plan = getattr(self.engine, "node_moe_placement_plan", None)
+        width = None
+        checksum = None
+        if node_plan is not None:
+            width = node_plan.routed_tp_layout.widths[self.config.tp_info.rank]
+            checksum = node_plan.checksum
+        local = cache.performance_telemetry_snapshot(
+            rank=self.config.tp_info.rank,
+            local_width=width,
+            placement_checksum=checksum,
+        )
+        snapshots = [None] * self.config.tp_info.size
+        if self.config.tp_info.size == 1:
+            snapshots[0] = local
+        else:
+            torch.distributed.all_gather_object(snapshots, local, group=self.tp_cpu_group)
+        from freetoken.moe.telemetry import aggregate_rank_snapshots
+
+        return aggregate_rank_snapshots(snapshots, expected_ranks=self.config.tp_info.size)
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):

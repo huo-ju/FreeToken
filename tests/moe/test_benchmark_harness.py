@@ -39,6 +39,27 @@ def test_tp4_server_command_preserves_graph_and_cache_configuration():
     assert "--disable-moe-prefill-overlap" in command
 
 
+def test_benchmark_can_freeze_the_host_placement_budget():
+    args = _BENCH.parse_args([
+        "--model", "/model", "--moe-host-budget-gb", "90.45",
+    ])
+    command = _BENCH.serve_cmd(args, "offload", 19000)
+    assert command[command.index("--moe-host-budget-gb") + 1] == "90.45"
+
+
+def test_benchmark_telemetry_is_explicit_and_reaches_server():
+    disabled = _BENCH.parse_args(["--model", "/model"])
+    assert "--moe-collect-stats" not in _BENCH.serve_cmd(disabled, "offload", 19000)
+
+    enabled = _BENCH.parse_args(["--model", "/model", "--moe-telemetry"])
+    assert "--moe-collect-stats" in _BENCH.serve_cmd(enabled, "offload", 19000)
+
+    timed = _BENCH.parse_args(["--model", "/model", "--moe-timing"])
+    timed_command = _BENCH.serve_cmd(timed, "offload", 19000)
+    assert "--moe-collect-stats" in timed_command
+    assert "--moe-collect-timing" in timed_command
+
+
 def test_server_readiness_has_no_default_deadline(monkeypatch):
     args = _BENCH.parse_args(["--model", "/model"])
     assert args.server_timeout == 0

@@ -728,6 +728,29 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        dest="moe_collect_stats",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect graph-safe MoE routing/copy counters and publish strict per-rank, "
+            "per-layer snapshots in /v1/stats. Disabled by default."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-collect-timing",
+        action="store_true",
+        dest="moe_collect_timing",
+        default=ServerArgs.moe_collect_timing,
+        help=(
+            "Record fixed CUDA-event timings for MoE components and publish the latest "
+            "completed forward in /v1/stats. Diagnostic-only because event graph nodes "
+            "perturb throughput; disabled by default."
+        ),
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",

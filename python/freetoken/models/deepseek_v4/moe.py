@@ -3,6 +3,8 @@ experts (GPU slot-cache / cpu / hybrid decode paths)."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -22,6 +24,7 @@ class Gate(nn.Module):
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
         super().__init__()
+        self.layer_id = layer_id
         self.topk = args.n_activated_experts
         self.score_func = args.score_func
         self.route_scale = args.route_scale
@@ -125,10 +128,10 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             )
         ):
             return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-        cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
+        cache.ensure_experts(
+            self.layer_id, topk_ids, record_stats=False
+        )  # prefill: in-place expert-id -> slot, excluded from decode counters
         cache.copy_missing()
-        if cache.collect_stats:
-            cache.record_decode_stats(self.layer_id)
         return self._expert_gemm(
             cache,
             hidden_states,
@@ -146,6 +149,7 @@ class MoE(nn.Module):
 
     def __init__(self, layer_id: int, args: DeepseekV4Args):
         super().__init__()
+        self.layer_id = layer_id
         self.dim = args.dim
         self.tp_size = get_tp_info().size
         self._comm = DistributedCommunicator()
@@ -154,19 +158,32 @@ class MoE(nn.Module):
         self.experts = DSV4OffloadMoELayer(layer_id, args)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        shape = x.size()
-        x = x.view(-1, self.dim)
-        weights, indices = self.gate(x, input_ids.flatten())
-        # Shared expert enqueued before routed_forward: hybrid decode blocks on the
-        # CPU pool inside routed_forward, so this GEMM must already be on the stream
-        # to overlap the CPU overflow compute.
-        shared = self.shared_experts(x)
-        # routed_forward may mutate the ids in place (offload decode slot remap);
-        # indices.to(int32) always copies (int64 source), so no clone needed here.
-        routed = self.experts.routed_forward(
-            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
-        )
-        output = routed + shared
-        if self.tp_size > 1:
-            output = self._comm.all_reduce(output)
-        return output.view(shape)
+        timing = getattr(self.experts.offload_cache, "cuda_timing", None)
+
+        def measured(component: str):
+            return (
+                timing.measure(self.layer_id, component)
+                if timing is not None
+                else nullcontext()
+            )
+
+        with measured("layer_wall"):
+            shape = x.size()
+            x = x.view(-1, self.dim)
+            weights, indices = self.gate(x, input_ids.flatten())
+            # Shared expert enqueued before routed_forward: hybrid decode blocks on the
+            # CPU pool inside routed_forward, so this GEMM must already be on the stream
+            # to overlap the CPU overflow compute.
+            with measured("shared_expert"):
+                shared = self.shared_experts(x)
+            # routed_forward may mutate the ids in place (offload decode slot remap);
+            # indices.to(int32) always copies (int64 source), so no clone needed here.
+            with measured("routed_total"):
+                routed = self.experts.routed_forward(
+                    x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+                )
+            output = routed + shared
+            if self.tp_size > 1:
+                with measured("all_reduce"):
+                    output = self._comm.all_reduce(output)
+            return output.view(shape)

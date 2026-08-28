@@ -37,6 +37,7 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        self.moe_telemetry: dict[str, Any] | None = None
 
     @property
     def active(self) -> int:
@@ -74,6 +75,8 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        if getattr(reply, "moe_telemetry", None) is not None:
+            self.moe_telemetry = reply.moe_telemetry
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -152,7 +155,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
-    return {
+    result = {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
         "uptime_s": uptime_s,
@@ -174,3 +177,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "completion_tokens_total": tr.completion_tokens_total,
         },
     }
+    # Additive and opt-in: legacy /v1/stats consumers see the exact prior schema.
+    if tr.moe_telemetry is not None:
+        result["moe_telemetry"] = tr.moe_telemetry
+    return result

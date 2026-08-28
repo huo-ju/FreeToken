@@ -373,6 +373,7 @@ class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
     copy_done_event: torch.cuda.Event
+    length_finished: tuple[bool, ...]
 
 
 def _prepare_cuda_device(config: EngineConfig) -> torch.device:
@@ -1224,6 +1225,13 @@ class Engine:
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
         # captured and re-run on every decode replay.
         cache.collect_stats = config.moe_collect_stats
+        if config.moe_collect_timing:
+            from freetoken.moe.cuda_timing import MoeCudaTiming
+
+            cache.cuda_timing = MoeCudaTiming(
+                num_layers=cache.num_layers,
+                device=cache.device,
+            )
         cache.execution_policy = config.moe_execution_policy
         from freetoken.moe.execution_plan import ExecutionPolicy, ExecutionPolicyAdapter
 
@@ -1550,13 +1558,19 @@ class Engine:
 
         for req in batch.reqs:
             req.complete_one()
+        # The scheduler may launch the next overlap iteration before it drains this
+        # output. Snapshot the length boundary here so that a later complete_one()
+        # cannot make this token look terminal one step too early.
+        length_finished = tuple(not req.can_decode for req in batch.reqs)
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
-        return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+        return ForwardOutput(
+            next_tokens_gpu, next_tokens_cpu, copy_done_event, length_finished
+        )
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

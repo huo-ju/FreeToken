@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from .utils import deserialize_type, serialize_type
 
@@ -45,6 +45,9 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # Latest completed-request MoE snapshot; consumed by StatsTracker and not
+    # included in ordinary generation protocol payloads.
+    moe_telemetry: Dict[str, Any] | None = None
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

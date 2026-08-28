@@ -9,6 +9,8 @@ streamed full-layer position (== expert id) for the grouped prefill path.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import triton
 
@@ -103,6 +105,9 @@ def routed_experts_fp4(
     down_packed: torch.Tensor,     # [S, H, I//2] uint8
     down_scale: torch.Tensor,      # [S, H, I//32] e8m0
     swiglu_limit: float,
+    *,
+    timing=None,
+    layer_id: int | None = None,
 ) -> torch.Tensor:
     """Full routed-expert output (summed over the top-k routes), excludes shared expert.
 
@@ -116,20 +121,30 @@ def routed_experts_fp4(
     two_I = gate_up_packed.shape[1]
     I = two_I // 2
 
-    x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip (no clone)
-    gate_up = _grouped_decode(
-        x, gate_up_packed, gate_up_scale, slots, None,
-        a_row_is_route=False, mul_routed_weight=False,
-    )  # [T, top_k, 2I]
-    act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
+    def measured(component: str):
+        return (
+            timing.measure(layer_id, component)
+            if timing is not None and layer_id is not None
+            else nullcontext()
+        )
 
-    act = act.reshape(T * top_k, I)
-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
-    down = _grouped_decode(
-        act, down_packed, down_scale, slots, topk_weights,
-        a_row_is_route=True, mul_routed_weight=True,
-    )  # [T, top_k, H]
-    return down.sum(dim=1)  # [T, H]
+    with measured("routed_gate_up"):
+        x = act_quant_fp8_roundtrip(x, 128)  # gate_up activation -> FP8 round-trip
+        gate_up = _grouped_decode(
+            x, gate_up_packed, gate_up_scale, slots, None,
+            a_row_is_route=False, mul_routed_weight=False,
+        )  # [T, top_k, 2I]
+    with measured("routed_activation"):
+        act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
+    with measured("routed_down"):
+        act = act.reshape(T * top_k, I)
+        act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+        down = _grouped_decode(
+            act, down_packed, down_scale, slots, topk_weights,
+            a_row_is_route=True, mul_routed_weight=True,
+        )  # [T, top_k, H]
+        result = down.sum(dim=1)  # [T, H]
+    return result
 
 
 # Above this the grouped GEMM beats the per-route GEMV despite its padding;

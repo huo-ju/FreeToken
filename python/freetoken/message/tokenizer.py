@@ -48,6 +48,8 @@ class DetokenizeMsg(BaseTokenizerMsg):
     swa_total_tokens: int = 0
     # Bytes this engine process holds on the GPU (torch reserved pool). 0 on CPU.
     gpu_mem_bytes: int = 0
+    # Present only on a terminal reply when --moe-collect-stats is enabled.
+    moe_telemetry: Dict[str, Any] | None = None
 
 
 @dataclass

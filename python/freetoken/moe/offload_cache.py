@@ -227,10 +227,17 @@ class OffloadMoeCache:
         # must be enabled before capture — see engine graph setup). The only graph artifact
         # is a one-off warm-up increment at capture time (<0.1% over a session).
         self.collect_stats = False
+        # Optional fixed CUDA-event recorder, attached by Engine before graph capture.
+        self.cuda_timing = None
         # [num_layers, N_STATS] -- ensure_experts passes lru_stats[layer_id] straight to
         # the kernel, which accumulates in the same launch. The stat_* tensors below stay
         # for the hybrid path, whose kernel is still ours.
         self.lru_stats = torch.zeros(
+            (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
+        )
+        # Short prefill chunks use the on-demand LRU path. Keep their movement
+        # separate so it cannot contaminate decode miss rates.
+        self.prefill_lru_stats = torch.zeros(
             (self.num_layers, N_STATS), dtype=torch.int64, device=self.device
         )
         self.stat_missing = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -293,6 +300,10 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # Logical expert-row movement (not bank rows). These host counters are
+        # updated by prefill scheduling, never by the decode/CUDA-graph hot path.
+        self.prefill_full_layer_rows = 0
+        self.prefill_h2d_rows = 0
 
     def prepare_gpu_resident_layers(
         self,
@@ -786,8 +797,12 @@ class OffloadMoeCache:
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
         elif self.prefill_copy_stream is None:
+            self.prefill_full_layer_rows += self.num_experts
+            self.prefill_h2d_rows += self.num_experts
             copy()
         else:
+            self.prefill_full_layer_rows += self.num_experts
+            self.prefill_h2d_rows += self.num_experts
             with torch.cuda.stream(self.prefill_copy_stream):
                 if self._prefill_buffer_has_release_event[buffer_id]:
                     self.prefill_copy_stream.wait_event(self.prefill_release_events[buffer_id])
@@ -868,6 +883,7 @@ class OffloadMoeCache:
         hit_mask = snap >= 2 * E
         self.prefill_hit_rows += int(hit_mask.sum())
         self.prefill_total_rows += E
+        self.prefill_h2d_rows += int((~hit_mask).sum())
         if self._gather_dst_ptrs is not None:
             prefill_hit_compact(self, layer_id, buffer_id)
             # blocks_per_bank=64 vs the PCIe-tuned default of 8: HBM D2D needs the
@@ -937,17 +953,35 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts(
+        self, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+    ) -> None:
         from freetoken.moe.offload_kernels import ensure_experts
 
-        if self.collect_decode_freq:
+        if record_stats and self.collect_decode_freq:
             # ``expert_ids`` still holds raw expert ids here (the kernel rewrites them to
             # slot ids in place), so snapshot the routing histogram before that happens.
             ids = expert_ids.reshape(-1).long()
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts(self, layer_id, expert_ids)
+        if self.cuda_timing is None:
+            ensure_experts(
+                self,
+                layer_id,
+                expert_ids,
+                collect_stats=self.collect_stats,
+                prefill_stats=not record_stats,
+            )
+        else:
+            with self.cuda_timing.measure(layer_id, "ensure_experts"):
+                ensure_experts(
+                    self,
+                    layer_id,
+                    expert_ids,
+                    collect_stats=self.collect_stats,
+                    prefill_stats=not record_stats,
+                )
 
     def map_gpu_resident_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Record routing stats while keeping expert ids in expert order.
@@ -997,6 +1031,8 @@ class OffloadMoeCache:
             )
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        self.prefill_full_layer_rows += self.num_experts
+        self.prefill_h2d_rows += self.num_experts
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
@@ -1010,7 +1046,10 @@ class OffloadMoeCache:
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        self.prefill_full_layer_rows = 0
+        self.prefill_h2d_rows = 0
         self.lru_stats.zero_()
+        self.prefill_lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -1096,9 +1135,18 @@ class OffloadMoeCache:
         fetched = self.stat_fetched_layer.tolist()
         per_layer = []
         for L in range(self.num_layers):
-            s, m, a, f = steps[L], missing[L], active[L], fetched[L]
+            s, m, a = int(steps[L]), int(missing[L]), int(active[L])
+            # Plain GPU offload fetches every miss. Hybrid has an explicit capped
+            # fetched counter; permanent layers have no misses and fetch nothing.
+            f = int(fetched[L]) if self.decode_target == "hybrid" else m
+            permanent = self.is_gpu_resident_layer(L)
             per_layer.append({
                 "layer": L,
+                "residency": "gpu_permanent" if permanent else "host_backed",
+                "calls": s,
+                "active": a,
+                "missing": m,
+                "fetched": f,
                 "steps": s,
                 "active_per_step": (a / s) if s else 0.0,
                 "missing_per_step": (m / s) if s else 0.0,
@@ -1106,6 +1154,59 @@ class OffloadMoeCache:
                 "fetched_per_step": (f / s) if s else 0.0,
             })
         return {"per_layer": per_layer}
+
+    def performance_telemetry_snapshot(
+        self,
+        *,
+        rank: int,
+        local_width: int | None = None,
+        placement_checksum: str | None = None,
+    ) -> dict:
+        """One rank's durable counter snapshot, read once at a request boundary."""
+        layers = self.decode_miss_stats_per_layer()["per_layer"]
+        prefill_cols = self.prefill_lru_stats.t().tolist()
+        prefill_active, prefill_missing, prefill_calls = (
+            prefill_cols[Stat.ACTIVE],
+            prefill_cols[Stat.MISS],
+            prefill_cols[Stat.CALLS],
+        )
+        prefill_on_demand = [
+            {
+                "layer": layer,
+                "calls": int(prefill_calls[layer]),
+                "active": int(prefill_active[layer]),
+                "missing": int(prefill_missing[layer]),
+                "fetched": int(prefill_missing[layer]),
+            }
+            for layer in range(self.num_layers)
+        ]
+        prefill_on_demand_h2d = sum(int(value) for value in prefill_missing)
+        storage = (
+            {
+                "runtime_expert_disk_reads": 0,
+                "disk_refill_experts": 0,
+                "disk_refill_bytes": 0,
+                "disk_refill_seconds": 0.0,
+            }
+            if self.bounded_source is None
+            else self.bounded_source.stats()
+        )
+        return {
+            "rank": int(rank),
+            "plan_epoch": int(self.plan_epoch),
+            "placement_checksum": placement_checksum,
+            "local_width": local_width,
+            "cache_slots": int(self.cache_size),
+            "layers": layers,
+            "prefill": {
+                "full_layer_rows": int(self.prefill_full_layer_rows),
+                "cache_hit_d2d_rows": int(self.prefill_hit_rows),
+                "h2d_rows": int(self.prefill_h2d_rows) + prefill_on_demand_h2d,
+                "on_demand_layers": prefill_on_demand,
+            },
+            "storage": storage,
+            "timing": self.cuda_timing.snapshot() if self.cuda_timing is not None else None,
+        }
 
     def decode_routing_stats(self) -> dict:
         """Per-layer decode routing concentration, for cache-skew analysis.
@@ -1140,6 +1241,15 @@ class OffloadMoeCache:
         }
 
     def copy_missing(self) -> None:
+        layer_id = self._pending_src_layer
+        assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.cuda_timing is None or self.is_gpu_resident_layer(layer_id):
+            self._copy_missing_impl()
+            return
+        with self.cuda_timing.measure(layer_id, "miss_copy"):
+            self._copy_missing_impl()
+
+    def _copy_missing_impl(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"

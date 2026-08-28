@@ -14,8 +14,8 @@ which stays correct even when the detokenizer coalesces a few tokens into one ev
 (multibyte characters): the window is still anchored on the first and last token's
 arrival. ``ignore_eos`` keeps the step count at exactly ``D`` regardless of sampling.
 TTFT is the measured run's warm first-token latency (template rendering + prefill
-included). Engine-internal diagnostics (expert-cache miss rate, hybrid fetch split) are
-not exposed over the API and are not reported; VRAM is the server's live /v1/stats figure.
+included). With ``--moe-telemetry``, graph-safe per-rank/per-layer routing and copy
+counters are persisted from the server's live /v1/stats document.
 
 Prompt: an AIME-25 problem sent as a chat message with thinking enabled -- a real
 reasoning workload, so expert routing is representative. The server renders the chat
@@ -145,6 +145,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--mem-ratio", type=float, default=0.9, help="target VRAM utilization")
     p.add_argument(
+        "--moe-host-budget-gb",
+        type=float,
+        default=None,
+        help="freeze aggregate expert host budget instead of using the startup snapshot",
+    )
+    p.add_argument(
         "--gpu",
         default=None,
         help="GPU for the serve: a UUID or nvidia-smi index (as ft serve --gpu)",
@@ -161,6 +167,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--no-prefill-overlap", action="store_true",
         help="disable the MoE prefill copy double buffer",
+    )
+    p.add_argument(
+        "--moe-telemetry", action="store_true",
+        help="enable per-rank/per-layer MoE counters and persist them in benchmark JSON",
+    )
+    p.add_argument(
+        "--moe-timing", action="store_true",
+        help=(
+            "record fixed CUDA-event MoE component timings and persist one snapshot "
+            "per measured repetition (diagnostic profile, not a scoreable baseline)"
+        ),
     )
     p.add_argument(
         "--greedy",
@@ -334,10 +351,16 @@ def serve_cmd(args: argparse.Namespace, backend: str, port: int) -> list[str]:
     ]
     if args.gpu:
         cmd += ["--gpu", args.gpu]
+    if args.moe_host_budget_gb is not None:
+        cmd += ["--moe-host-budget-gb", str(args.moe_host_budget_gb)]
     if args.moe_disk_backed:
         cmd.append("--moe-disk-backed")
     if args.no_prefill_overlap:
         cmd.append("--disable-moe-prefill-overlap")
+    if args.moe_telemetry or args.moe_timing:
+        cmd.append("--moe-collect-stats")
+    if args.moe_timing:
+        cmd.append("--moe-collect-timing")
     if args.num_tokens is not None:
         cmd += ["--num-tokens", str(args.num_tokens)]
     if args.cache_sequence is not None:
@@ -358,6 +381,19 @@ def _git_commit() -> str:
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+
+
+def _git_worktree_dirty() -> bool | None:
+    try:
+        return bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def _placement_log_metadata(log_path: str) -> dict:
@@ -638,6 +674,7 @@ def _summarize_measurements(
     problem: str,
     measured: list[dict],
     stats: dict,
+    stats_before: dict,
     cache_status: dict,
     cache_size: int | None,
     command: list[str],
@@ -680,10 +717,18 @@ def _summarize_measurements(
     def median(field: str) -> float:
         return statistics.median(run[field] for run in runs)
 
+    telemetry = stats.get("moe_telemetry")
+    telemetry_before = stats_before.get("moe_telemetry")
+    if telemetry is not None and telemetry_before is not None:
+        from freetoken.moe.telemetry import subtract_snapshots
+
+        telemetry = subtract_snapshots(telemetry, telemetry_before)
+
     row = {
         "schema": "freetoken.moe-server-benchmark",
         "version": 1,
         "commit": _git_commit(),
+        "worktree_dirty": _git_worktree_dirty(),
         "command": shlex.join(command),
         "model": args.model,
         "backend": backend,
@@ -692,6 +737,7 @@ def _summarize_measurements(
         "moe_tp_layout": args.moe_tp_layout,
         "moe_disk_backed": args.moe_disk_backed,
         "memory_ratio": args.mem_ratio,
+        "moe_host_budget_gb": args.moe_host_budget_gb,
         "moe_cache_size": cache_size,
         "kv_token_override": args.num_tokens,
         "problem": args.problem,
@@ -711,6 +757,13 @@ def _summarize_measurements(
         "prefill_overlap": not args.no_prefill_overlap,
         "cache_initial_state": "one warm-up request after startup/rebuild",
         "cache_status": cache_status,
+        # Counter delta covering only the measured repetitions (warm-up excluded).
+        "moe_telemetry": telemetry,
+        "moe_timing_runs": (
+            [result.get("moe_timing") for result in measured]
+            if args.moe_timing
+            else None
+        ),
         "gpu_topology": topology,
         "host_memory_before": host_before,
         "host_memory_after": host_after,
@@ -756,7 +809,16 @@ def run_one(args: argparse.Namespace, backend: str) -> list[dict]:
     sampling, sampling_src = resolve_sampling(args.model, args.greedy)
     port = free_port()
     origin = f"http://127.0.0.1:{port}"
-    fd, log_path = tempfile.mkstemp(prefix=f"bench-serve-{backend}-", suffix=".log")
+    if args.json_out:
+        artifact = Path(args.json_out)
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        fd, log_path = tempfile.mkstemp(
+            prefix=f"{artifact.name}.{backend}.",
+            suffix=".server.log",
+            dir=artifact.parent,
+        )
+    else:
+        fd, log_path = tempfile.mkstemp(prefix=f"bench-serve-{backend}-", suffix=".log")
     cmd = serve_cmd(args, backend, port)
     host_before = _meminfo()
     topology = _gpu_topology(args.gpu, args.tp_size)
@@ -799,14 +861,27 @@ def run_one(args: argparse.Namespace, backend: str) -> list[dict]:
                         raise RuntimeError(f"cache rebuild to {cache_size} failed: {rebuild}")
                 # Re-establish a comparable warm state after startup or rebuild.
                 stream_generate(origin, model_id, problem, sampling, args)
-                measured = [
-                    stream_generate(origin, model_id, problem, sampling, args)
-                    for _ in range(args.repetitions)
-                ]
+                stats_before = get_json(f"{origin}/v1/stats")
+                measured = []
+                stats = stats_before
+                for _ in range(args.repetitions):
+                    result = stream_generate(origin, model_id, problem, sampling, args)
+                    stats = get_json(f"{origin}/v1/stats")
+                    if args.moe_timing:
+                        snapshot = stats.get("moe_telemetry") or {}
+                        result["moe_timing"] = {
+                            "aggregate": snapshot.get("timing"),
+                            "ranks": [
+                                {"rank": rank.get("rank"), "timing": rank.get("timing")}
+                                for rank in snapshot.get("ranks", [])
+                            ],
+                        }
+                    measured.append(result)
                 measurement_sets.append((
                     cache_size,
                     measured,
-                    get_json(f"{origin}/v1/stats"),
+                    stats_before,
+                    stats,
                     get_json(f"{origin}/v1/cache/status"),
                 ))
         finally:
@@ -821,6 +896,7 @@ def run_one(args: argparse.Namespace, backend: str) -> list[dict]:
             problem=problem,
             measured=measured,
             stats=stats,
+            stats_before=stats_before,
             cache_status=cache_status,
             cache_size=cache_size,
             command=cmd,
@@ -830,7 +906,7 @@ def run_one(args: argparse.Namespace, backend: str) -> list[dict]:
             resource_summary=resource_summary,
             server_log=log_path,
         )
-        for cache_size, measured, stats, cache_status in measurement_sets
+        for cache_size, measured, stats_before, stats, cache_status in measurement_sets
     ]
 
 

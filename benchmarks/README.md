@@ -45,8 +45,21 @@ python benchmarks/bench_decode_moe.py \
   --execution-policy force_weighted_tp \
   --moe-tp-layout 512,512,768,256 \
   --eval-plan /path/to/test_plan.json --case-id decode_64_r0 \
-  --decode 64 --greedy --repetitions 3 --json weighted.jsonl
+  --decode 64 --greedy --repetitions 3 --moe-telemetry --json weighted.jsonl
 ```
+
+`--moe-telemetry` is opt-in. It persists the complete TP-rank/layer counter
+matrix from `/v1/stats`; the artifact subtracts the post-warm-up snapshot, so
+calls, misses, fetches, and prefill movement cover only measured repetitions.
+Missing ranks or mismatched placement epochs/checksums fail the run. When
+`--json` is set, the complete server log is retained beside the JSONL artifact.
+Add `--moe-timing` to capture fixed external CUDA events into the decode graph;
+the artifact stores one per-rank/per-layer component snapshot for every measured
+repetition and identifies the critical rank for each layer. Use
+`--moe-host-budget-gb` for A/B runs so startup memory noise cannot change the
+permanent-layer placement. Component timing is a profiling mode, not a scoreable
+baseline mode: on the SM75 TP4 reference run its event nodes reduced throughput
+by about 3.8%. Counter-only telemetry remained below the 1% perturbation limit.
 
 Weighted TP currently accepts only original DSV4 DS-FP4 safetensors. It rejects
 FTW banks before expert allocation because those banks encode the older TP1 layout.

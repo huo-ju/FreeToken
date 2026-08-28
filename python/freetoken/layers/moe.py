@@ -599,6 +599,8 @@ class OffloadMoELayer(MoELayer):
                 hidden_states, topk_ids, topk_weights,
                 gate_up_packed, gate_up_scale, down_packed, down_scale,
                 self.swiglu_limit,
+                timing=(None if is_prefill else cache.cuda_timing),
+                layer_id=self.layer_id,
             )
         assert fmt == "bf16", f"unknown quant_format {fmt!r}"
         gate_up, down = views

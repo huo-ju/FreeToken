@@ -62,6 +62,8 @@ class EngineConfig:
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.
     moe_prefill_hit_d2d: bool = False
     moe_collect_stats: bool = False  # capture decode miss-rate counters into the cuda graph
+    # Fixed external CUDA events captured into the graph; read only at request end.
+    moe_collect_timing: bool = False
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0

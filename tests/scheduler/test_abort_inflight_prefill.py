@@ -67,6 +67,7 @@ def _setup():
         _mamba_slot_usage=lambda: None,
         _swa_token_usage=lambda: None,
         _gpu_mem_bytes=lambda: 0,
+        _collect_moe_telemetry=lambda: None,
         _match_stop_str=lambda _req: None,
         _pending_abort_acks=set(),
         _last_data=None,
@@ -93,11 +94,13 @@ def _launch_req(pool, cm, tm, prompt, *, cls=Req, track_seqlen=None):
     return req
 
 
-def _as_last_data(batch):
+def _as_last_data(batch, *, length_finished=None, token=42):
+    if length_finished is None:
+        length_finished = tuple(not req.can_decode for req in batch.reqs)
     return (
         SimpleNamespace(batch=batch),
-        (None, torch.tensor([42], dtype=torch.int32),
-         SimpleNamespace(synchronize=lambda: None)),
+        (None, torch.tensor([token], dtype=torch.int32),
+         SimpleNamespace(synchronize=lambda: None), length_finished),
     )
 
 
@@ -222,3 +225,37 @@ def test_post_terminal_overlap_step_is_dropped():
     assert [m for m in sent if isinstance(m, DetokenizeMsg)] == terminal  # no 2nd msg
     assert req.output_len == output_len_before                           # no append
     cm.check_integrity()
+
+
+def test_overlap_length_finish_uses_forward_boundary_snapshot():
+    """A newer overlap launch must not make the prior token terminal early."""
+    from freetoken.message import DetokenizeMsg
+
+    pool, cm, tm, dm, _pm, sent, stub = _setup()
+    req = _launch_req(pool, cm, tm, torch.arange(1, 13, dtype=torch.int32))
+    dm.filter_reqs([req])
+
+    # Pretend the request has exactly two sampled tokens left. The prior forward
+    # completed while one token still remained, then the next overlap launch
+    # consumed that final budget before the prior output was drained.
+    req.device_len = req.max_device_len - 2
+    req.cached_len = req.device_len - 1
+    req.complete_one()
+    prior_finished = (not req.can_decode,)
+    assert prior_finished == (False,)
+    req.complete_one()
+    assert not req.can_decode
+
+    batch = Batch(reqs=[req], phase="decode")
+    Scheduler._process_last_data(
+        stub, _as_last_data(batch, length_finished=prior_finished, token=41)
+    )
+    messages = [m for m in sent if isinstance(m, DetokenizeMsg)]
+    assert len(messages) == 1 and not messages[0].finished
+
+    Scheduler._process_last_data(
+        stub, _as_last_data(batch, length_finished=(True,), token=42)
+    )
+    messages = [m for m in sent if isinstance(m, DetokenizeMsg)]
+    assert len(messages) == 2 and messages[-1].finished
+    assert messages[-1].finish_reason == "length"
